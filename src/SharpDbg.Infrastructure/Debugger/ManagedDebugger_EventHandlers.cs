@@ -10,11 +10,11 @@ public partial class ManagedDebugger
 	private void HandleProcessCreated(object? sender, CreateProcessCorDebugManagedCallbackEventArgs createProcessCorDebugManagedCallbackEventArgs)
 	{
 		_logger?.Invoke("Process created event");
-		if (_process is null && _isRemoteAttach)
+		if (_process is null)
 		{
 			_process = createProcessCorDebugManagedCallbackEventArgs.Process;
 			_isAttached = true;
-			_logger?.Invoke($"Remote debuggee established connection to debugger, PID: {_process.Id}");
+			_logger?.Invoke($"Process obtained from create event, PID: {_process.Id}");
 		}
 		Continue();
 	}
@@ -98,11 +98,9 @@ public partial class ManagedDebugger
 		// Fire the module loaded event
 		OnModuleLoaded?.Invoke(modulePath, Path.GetFileName(modulePath), modulePath);
 
-		// Try to bind any pending breakpoints now that we have a new module with symbols
-		if (symbolReader is not null)
-		{
-			TryBindPendingBreakpoints();
-		}
+		// Try to bind any pending breakpoints now that we have a new module loaded.
+		// IL-level breakpoints may be resolvable even without a PDB by reading PE metadata.
+		TryBindPendingBreakpoints();
 
 		Continue();
 	}
@@ -187,7 +185,7 @@ public partial class ManagedDebugger
 		}
 
 		if (managedBreakpoint.ResolvedBreakpointFromPdb is not {} resolvedBreakpoint) throw new UnreachableException("Breakpoint was not resolved from PDB - this should never happen, as breakpoints are only bound to resolved source locations");
-		OnStopped2?.Invoke(corThread.Id, managedBreakpoint.FilePath, resolvedBreakpoint.StartLine, resolvedBreakpoint.StartColumn, "breakpoint", null);
+		OnStopped2?.Invoke(corThread.Id, managedBreakpoint.FilePath, resolvedBreakpoint.StartLine, resolvedBreakpoint.StartColumn, "breakpoint", null, managedBreakpoint.Id);
 	}
 
 	private void HandleStepComplete(object? sender, StepCompleteCorDebugManagedCallbackEventArgs stepCompleteEventArgs)
@@ -241,7 +239,7 @@ public partial class ManagedDebugger
 
 		var (sourceFilePath, line, column, decompiledSourceInfo) = sourceInfo.Value;
 		//_logger?.Invoke($"StepComplete: method 0x{ilFrame.Function.Token} IL offset {ilFrame.IP.pnOffset}, reason: {stepCompleteEventArgs.Reason}");
-		OnStopped2?.Invoke(corThread.Id, sourceFilePath, line, column, "step", decompiledSourceInfo);
+		OnStopped2?.Invoke(corThread.Id, sourceFilePath, line, column, "step", decompiledSourceInfo, 0);
 	}
 
 	private void HandleBreak(object? sender, BreakCorDebugManagedCallbackEventArgs breakEventArgs)

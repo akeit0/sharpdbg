@@ -1,9 +1,13 @@
+using System.Reflection.Metadata;
+using System.Reflection.Metadata.Ecma335;
 using System.Reflection.PortableExecutable;
+using System.Text;
 using ClrDebug;
 using ICSharpCode.Decompiler;
 using ICSharpCode.Decompiler.CSharp;
 using ICSharpCode.Decompiler.CSharp.Transforms;
 using ICSharpCode.Decompiler.DebugInfo;
+using ICSharpCode.Decompiler.Disassembler;
 using ICSharpCode.Decompiler.Metadata;
 using ICSharpCode.Decompiler.TypeSystem;
 using SharpDbg.Infrastructure.Debugger.Decompilation;
@@ -159,6 +163,101 @@ public partial class ManagedDebugger
 
 			_logger?.Invoke($"GeneratePdb: successfully loaded generated PDB for '{Path.GetFileName(assemblyPath)}'");
 			return symbolReader;
+		}
+	}
+
+	/// <summary>
+	/// Decompile the method in the given stack frame to C# source or IL.
+	/// </summary>
+	public string? DecompileFrame(int frameId, bool ilMode = false)
+	{
+		var frameInfo = _frameReferenceManager.GetFrameInfoById(frameId);
+		if (frameInfo is null)
+			return null;
+
+		try
+		{
+			var ilFrame = GetFrameForThreadIdAndStackDepth(frameInfo.Value.threadId, frameInfo.Value.frameStackDepth);
+			var function = ilFrame.Function;
+			var module = _modules[function.Module.BaseAddress];
+			var methodToken = function.Token;
+			var assemblyPath = module.ModulePath;
+
+			if (string.IsNullOrEmpty(assemblyPath) || !File.Exists(assemblyPath))
+				return null;
+
+			return ilMode
+				? DecompileMethodToIl(assemblyPath, methodToken)
+				: DecompileMethod(assemblyPath, methodToken);
+		}
+		catch (Exception ex)
+		{
+			_logger?.Invoke($"DecompileFrame failed: {ex.Message}");
+			return null;
+		}
+	}
+
+	private string? DecompileMethod(string assemblyPath, int methodToken)
+	{
+		var allModulePaths = _modules.Values.Select(m => m.ModulePath).Where(p => !string.IsNullOrEmpty(p)).ToList();
+		var resolver = new DebuggingAssemblyResolver(allModulePaths);
+
+		PEFile file;
+		try
+		{
+			file = new PEFile(assemblyPath, PEStreamOptions.PrefetchEntireImage);
+		}
+		catch (Exception ex)
+		{
+			_logger?.Invoke($"DecompileMethod: failed to open PE file '{assemblyPath}': {ex.Message}");
+			return null;
+		}
+
+		using (file)
+		{
+			var decompilerSettings = new DecompilerSettings();
+			var decompilerTypeSystem = new DecompilerTypeSystem(file, resolver, decompilerSettings);
+			var decompiler = new CSharpDecompiler(decompilerTypeSystem, decompilerSettings);
+			var methodHandle = MetadataTokens.MethodDefinitionHandle(methodToken);
+			var syntaxTree = decompiler.Decompile(methodHandle);
+			return PortablePdbWriter2.SyntaxTreeToString(syntaxTree, decompilerSettings);
+		}
+	}
+
+	private string? DecompileMethodToIl(string assemblyPath, int methodToken)
+	{
+		PEFile file;
+		try
+		{
+			file = new PEFile(assemblyPath, PEStreamOptions.PrefetchEntireImage);
+		}
+		catch (Exception ex)
+		{
+			_logger?.Invoke($"DecompileMethodToIl: failed to open PE file '{assemblyPath}': {ex.Message}");
+			return null;
+		}
+
+		using (file)
+		{
+			try
+			{
+				var sb = new StringBuilder();
+				using var writer = new StringWriter(sb);
+				var output = new PlainTextOutput(writer) { IndentationString = "  " };
+				var disassembler = new ReflectionDisassembler(output, CancellationToken.None)
+				{
+					ShowSequencePoints = false,
+					ShowRawRVAOffsetAndBytes = false,
+				};
+				var methodHandle = MetadataTokens.MethodDefinitionHandle(methodToken);
+				disassembler.DisassembleMethod(file, methodHandle);
+				return sb.ToString();
+			}
+			catch (Exception ex)
+			{
+				_logger?.Invoke($"DecompileMethodToIl: failed to disassemble method 0x{methodToken:X}: {ex.Message}");
+				return null;
+			}
 		}
 	}
 }

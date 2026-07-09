@@ -14,6 +14,13 @@ namespace SharpDbg.Infrastructure.Debugger;
 
 public record SharpDbgBreakpointRequest(int Line, string? Condition = null, string? HitCondition = null, int? Column = null);
 
+public record SharpDbgIlBreakpointRequest(
+    string MethodName,
+    int IlOffset,
+    string? ModuleName = null,
+    string? Condition = null,
+    string? HitCondition = null);
+
 public partial class ManagedDebugger
 {
 	// Store launch info for deferred attach in ConfigurationDone
@@ -72,7 +79,8 @@ public partial class ManagedDebugger
 		using var process = Process.Start(processStartInfo);
 		if (process is null) throw new InvalidOperationException("Process start failed");
 
-		var processId = process.Id;
+		_processId = process.Id;
+		var processId = _processId;
 
 		_logger?.Invoke($"Process created suspended with PID: {processId}");
 
@@ -135,7 +143,7 @@ public partial class ManagedDebugger
 		{
 			var launchedProcessId = await Task.Run(() => SendRunInTerminalRequest.Invoke(_pendingLaunchInfo)); // get off the dispatcher thread
 			_pendingLaunchInfo = null;
-			PerformAttach(launchedProcessId);
+			await PerformAttach(launchedProcessId);
 			await DiagnosticClientHelper.DiagnosticClientResumeRuntime(launchedProcessId);
 		}
 		else if (_pendingLaunchInfo is not null) // If we have a pending launch, perform it
@@ -144,13 +152,13 @@ public partial class ManagedDebugger
 		}
 		else if (_pendingRemoteAttachInfo is not null)
 		{
-			PerformRemoteAttach(_pendingRemoteAttachInfo);
+			await PerformRemoteAttach(_pendingRemoteAttachInfo);
 			_pendingRemoteAttachInfo = null;
 		}
 		// Otherwise check for pending attach
 		else if (_pendingAttachProcessId.HasValue)
 		{
-			PerformAttach(_pendingAttachProcessId.Value);
+			await PerformAttach(_pendingAttachProcessId.Value);
 			_pendingAttachProcessId = null;
 		}
 	}
@@ -169,6 +177,8 @@ public partial class ManagedDebugger
 		Guard.Against.Null(_process);
 		_variableManager.ClearAndDisposeHandleValues();
 		_frameReferenceManager.Clear();
+		if (_process.TryIsRunning(out var isRunning) is HRESULT.S_OK && isRunning)
+			return;
 		_process.Continue(false);
 	}
 
@@ -332,6 +342,59 @@ public partial class ManagedDebugger
 	}
 
 	/// <summary>
+	/// Set IL-level breakpoints for a method
+	/// </summary>
+	public List<BreakpointManager.BreakpointInfo> SetIlBreakpoints(string methodKey, SharpDbgIlBreakpointRequest[] breakpoints)
+	{
+		_logger?.Invoke($"SetIlBreakpoints: {methodKey}, breakpoints: {string.Join(",", breakpoints.Select(b => $"IL_{b.IlOffset:X4}"))}");
+
+		// Deactivate and clear existing IL breakpoints for this method
+		var existingBreakpoints = _breakpointManager.GetBreakpointsForMethod(methodKey);
+		foreach (var bp in existingBreakpoints)
+		{
+			if (bp.CorBreakpoint is not null)
+			{
+				try
+				{
+					bp.CorBreakpoint.Activate(false);
+				}
+				catch (Exception ex)
+				{
+					_logger?.Invoke($"Error deactivating IL breakpoint: {ex.Message}");
+				}
+			}
+		}
+		_breakpointManager.ClearBreakpointsForMethod(methodKey);
+
+		// Create new breakpoints
+		var result = new List<BreakpointManager.BreakpointInfo>();
+		foreach (var request in breakpoints)
+		{
+			var bp = _breakpointManager.CreateIlBreakpoint(
+				methodKey,
+				request.MethodName,
+				request.IlOffset,
+				request.ModuleName,
+				request.Condition,
+				request.HitCondition);
+
+			// Try to bind the breakpoint if we have a process
+			if (_process is not null)
+			{
+				TryBindIlBreakpoint(bp);
+			}
+			else
+			{
+				bp.Message = "Breakpoint has not been processed by the debugger.";
+			}
+
+			result.Add(bp);
+		}
+
+		return result;
+	}
+
+	/// <summary>
 	/// Get all threads
 	/// </summary>
 	public List<(int id, string name)> GetThreads()
@@ -362,10 +425,12 @@ public partial class ManagedDebugger
 	{
 		var result = new List<StackFrameInfo>();
 
-		if (!_threads.TryGetValue(threadId, out var thread))
-		{
+		if (_process is null)
 			return result;
-		}
+
+		var thread = _process.Threads.FirstOrDefault(t => t.Id == threadId);
+		if (thread is null)
+			return result;
 
 		try
 		{

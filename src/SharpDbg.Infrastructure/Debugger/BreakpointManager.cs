@@ -10,6 +10,7 @@ public class BreakpointManager
 	private int _nextBreakpointId = 1;
 	private readonly Dictionary<int, BreakpointInfo> _breakpoints = new();
 	private readonly Dictionary<string, List<int>> _breakpointsByFile = new();
+	private readonly Dictionary<string, List<int>> _breakpointsByMethod = new();
 	private readonly Lock _lock = new();
 
 	public class BreakpointInfo
@@ -20,6 +21,11 @@ public class BreakpointManager
 		public int? Column { get; set; }
 		public int EndLine { get; set; }
 		public int? EndColumn { get; set; }
+		public bool IsIlBreakpoint { get; set; }
+		public string MethodName { get; set; } = string.Empty;
+		public string MethodKey { get; set; } = string.Empty;
+		public string? ModuleName { get; set; }
+		public int IlOffset { get; set; }
 		public bool Verified { get; set; }
 		public CorDebugFunctionBreakpoint? CorBreakpoint { get; set; }
 		public string? Message { get; set; }
@@ -37,7 +43,7 @@ public class BreakpointManager
 	}
 
 	/// <summary>
-	/// Create a new breakpoint
+	/// Create a new source breakpoint
 	/// </summary>
 	public BreakpointInfo CreateBreakpoint(string filePath, int line, int? column = null, string? condition = null, string? hitCondition = null)
 	{
@@ -65,6 +71,43 @@ public class BreakpointManager
 				_breakpointsByFile[filePath] = [];
 			}
 			_breakpointsByFile[filePath].Add(id);
+
+			return bp;
+		}
+	}
+
+	/// <summary>
+	/// Create a new IL-level method breakpoint
+	/// </summary>
+	public BreakpointInfo CreateIlBreakpoint(string methodKey, string methodName, int ilOffset, string? moduleName = null, string? condition = null, string? hitCondition = null)
+	{
+		lock (_lock)
+		{
+			var id = _nextBreakpointId++;
+			if (string.IsNullOrWhiteSpace(condition)) condition = null;
+			if (string.IsNullOrWhiteSpace(hitCondition)) hitCondition = null;
+			var bp = new BreakpointInfo
+			{
+				Id = id,
+				FilePath = methodKey,
+				MethodKey = methodKey,
+				MethodName = methodName,
+				ModuleName = moduleName,
+				IsIlBreakpoint = true,
+				IlOffset = ilOffset,
+				Verified = false,
+				Condition = condition,
+				HitCondition = hitCondition,
+				HitCount = 0
+			};
+
+			_breakpoints[id] = bp;
+
+			if (!_breakpointsByMethod.ContainsKey(methodKey))
+			{
+				_breakpointsByMethod[methodKey] = [];
+			}
+			_breakpointsByMethod[methodKey].Add(id);
 
 			return bp;
 		}
@@ -115,6 +158,39 @@ public class BreakpointManager
 	}
 
 	/// <summary>
+	/// Get all IL breakpoints for a method key
+	/// </summary>
+	public List<BreakpointInfo> GetBreakpointsForMethod(string methodKey)
+	{
+		lock (_lock)
+		{
+			if (_breakpointsByMethod.TryGetValue(methodKey, out var ids))
+			{
+				return ids.Select(id => _breakpoints[id]).ToList();
+			}
+			return [];
+		}
+	}
+
+	/// <summary>
+	/// Clear all IL breakpoints for a method key
+	/// </summary>
+	public void ClearBreakpointsForMethod(string methodKey)
+	{
+		lock (_lock)
+		{
+			if (_breakpointsByMethod.TryGetValue(methodKey, out var ids))
+			{
+				foreach (var id in ids)
+				{
+					_breakpoints.Remove(id);
+				}
+				_breakpointsByMethod.Remove(methodKey);
+			}
+		}
+	}
+
+	/// <summary>
 	/// Find breakpoint by ClrDebug breakpoint
 	/// </summary>
 	public BreakpointInfo? FindByCorBreakpoint(ICorDebugFunctionBreakpoint corBreakpoint)
@@ -156,10 +232,15 @@ public class BreakpointManager
 		{
 			if (!_breakpoints.TryGetValue(id, out var bp)) return false;
 			_breakpoints.Remove(id);
-			if (_breakpointsByFile.TryGetValue(bp.FilePath, out var ids))
+			if (_breakpointsByFile.TryGetValue(bp.FilePath, out var fileIds))
 			{
-				ids.Remove(id);
-				if (ids.Count == 0) _breakpointsByFile.Remove(bp.FilePath);
+				fileIds.Remove(id);
+				if (fileIds.Count == 0) _breakpointsByFile.Remove(bp.FilePath);
+			}
+			if (_breakpointsByMethod.TryGetValue(bp.MethodKey, out var methodIds))
+			{
+				methodIds.Remove(id);
+				if (methodIds.Count == 0) _breakpointsByMethod.Remove(bp.MethodKey);
 			}
 			return true;
 		}
@@ -174,6 +255,7 @@ public class BreakpointManager
 		{
 			_breakpoints.Clear();
 			_breakpointsByFile.Clear();
+			_breakpointsByMethod.Clear();
 			_nextBreakpointId = 1;
 		}
 	}

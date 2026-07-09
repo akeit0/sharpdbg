@@ -1,7 +1,11 @@
 using System.Diagnostics;
+using System.Reflection.Metadata;
+using System.Reflection.Metadata.Ecma335;
+using System.Reflection.PortableExecutable;
 using System.Runtime.InteropServices;
 using Ardalis.GuardClauses;
 using ClrDebug;
+using ICSharpCode.Decompiler.Metadata;
 using SharpDbg.Infrastructure.Debugger.ExpressionEvaluator;
 using SharpDbg.Infrastructure.Debugger.ExpressionEvaluator.Compiler;
 using SharpDbg.Infrastructure.Debugger.ExpressionEvaluator.Interpreter;
@@ -25,13 +29,14 @@ public partial class ManagedDebugger
 	private bool _isAttached;
 	private bool _isRemoteAttach;
 	private int? _pendingAttachProcessId;
+	private int _processId;
 	private bool _justMyCode;
 	private AsyncStepper? _asyncStepper;
 	private CompiledExpressionInterpreter _expressionInterpreter = null!;
 
 	public event Action<int, string>? OnStopped;
-	// ThreadId, FilePath, Line, Column, Reason
-	public event Action<int, string, int, int, string, DecompiledSourceInfo?>? OnStopped2;
+	// ThreadId, FilePath, Line, Column, Reason, BreakpointId
+	public event Action<int, string, int, int, string, DecompiledSourceInfo?, int>? OnStopped2;
 	public event Action<int>? OnContinued;
 	public event Action? OnExited;
 	public event Action? OnTerminated;
@@ -43,6 +48,27 @@ public partial class ManagedDebugger
 	public event Func<LaunchInfo, int> SendRunInTerminalRequest = null!;
 
 	public EvalStatus EvalStatus { get; }
+
+	public bool IsProcessAttached => _process is not null;
+
+	public int ProcessId => _processId;
+
+	public bool IsProcessRunning
+	{
+		get
+		{
+			if (_process is null)
+				return false;
+			try
+			{
+				return _process.IsRunning;
+			}
+			catch
+			{
+				return false;
+			}
+		}
+	}
 
 	public ManagedDebugger(Action<string>? logger = null)
 	{
@@ -94,13 +120,13 @@ public partial class ManagedDebugger
 	/// <summary>
 	/// Actually attach to an existing process
 	/// </summary>
-	private void PerformAttach(int processId)
+	private async Task PerformAttach(int processId)
 	{
 		_logger?.Invoke($"Attaching to process: {processId}");
 
 		// Initialize the debugger
 		var dbgshim = new DbgShim(NativeLibrary.Load("dbgshim", typeof(ManagedDebugger).Assembly, null));
-		_ = Task.Run(() =>
+		await Task.Run(() =>
 		{
 			_corDebug = ClrDebugExtensions.Automatic(dbgshim, processId);
 			_corDebug.Initialize();
@@ -108,14 +134,15 @@ public partial class ManagedDebugger
 
 			// Attach to the process
 			_process = _corDebug.DebugActiveProcess(processId, false);
+			_processId = processId;
 			_isAttached = true;
 
 			_logger?.Invoke($"Attached to process: {processId}");
 			SendAllBreakpointEvents();
-		});
+		}).ConfigureAwait(false);
 	}
 
-	private void PerformRemoteAttach(RemoteAttachInfo remoteAttachInfo)
+	private async Task PerformRemoteAttach(RemoteAttachInfo remoteAttachInfo)
 	{
 		_logger?.Invoke($"Attaching to remote process on {remoteAttachInfo.Address}:{remoteAttachInfo.Port}");
 
@@ -130,7 +157,7 @@ public partial class ManagedDebugger
 		} catch { /* */ }
 
 		_logger?.Invoke($"Debugger listening on port {remoteAttachInfo.Port}, awaiting connection from debuggee");
-		_ = Task.Run(SendAllBreakpointEvents);
+		await Task.Run(SendAllBreakpointEvents).ConfigureAwait(false);
 	}
 
 	private void SendAllBreakpointEvents()
@@ -204,6 +231,9 @@ public partial class ManagedDebugger
 	/// </summary>
 	private bool TryBindBreakpoint(BreakpointManager.BreakpointInfo bp)
 	{
+		if (bp.IsIlBreakpoint)
+			return TryBindIlBreakpoint(bp);
+
 		try
 		{
 			if (_process is null) return false;
@@ -266,6 +296,137 @@ public partial class ManagedDebugger
 	}
 
 	/// <summary>
+	/// Try to bind an IL-level method breakpoint
+	/// </summary>
+	private bool TryBindIlBreakpoint(BreakpointManager.BreakpointInfo bp)
+	{
+		try
+		{
+			if (_process is null) return false;
+
+			var (targetModule, methodToken) = TryResolveMethodToken(bp.MethodName, bp.ModuleName);
+			if (targetModule is null)
+			{
+				bp.Verified = false;
+				bp.Message = "The breakpoint will not currently be hit. The method could not be found.";
+				_logger?.Invoke($"IL breakpoint {bp.MethodName}:IL_{bp.IlOffset:X4} - method not found");
+				return false;
+			}
+
+			// Get the function from the method token
+			var function = targetModule.Module.GetFunctionFromToken(methodToken);
+			var ilCode = function.ILCode;
+
+			// Create a breakpoint at the IL offset
+			var corBreakpoint = ilCode.CreateBreakpoint(bp.IlOffset);
+			corBreakpoint.Activate(true);
+
+			// Update breakpoint info
+			bp.CorBreakpoint = corBreakpoint;
+			bp.Verified = true;
+			bp.ModuleBaseAddress = targetModule.BaseAddress;
+			bp.ResolvedBreakpointFromPdb = new SymbolReader.ResolvedBreakpoint(
+				methodToken,
+				bp.IlOffset,
+				bp.IlOffset,
+				bp.IlOffset,
+				0,
+				0,
+				bp.FilePath);
+			bp.Message = null;
+
+			_logger?.Invoke($"IL breakpoint bound at {bp.FilePath}:IL_{bp.IlOffset:X4} -> method 0x{methodToken:X}");
+			return true;
+		}
+		catch (Exception ex)
+		{
+			_logger?.Invoke($"Error binding IL breakpoint {bp.FilePath}:IL_{bp.IlOffset:X4}: {ex.Message}");
+			bp.Verified = false;
+			bp.Message = $"Error binding IL breakpoint: {ex.Message}";
+			return false;
+		}
+	}
+
+	/// <summary>
+	/// Try to resolve a method token by name across loaded modules.
+	/// </summary>
+	private (ModuleInfo? Module, int MethodToken) TryResolveMethodToken(string methodName, string? moduleName)
+	{
+		var lastDot = methodName.LastIndexOf('.');
+		if (lastDot <= 0)
+			return (null, 0);
+
+		var requestedType = methodName.Substring(0, lastDot);
+		var requestedMethod = methodName.Substring(lastDot + 1);
+
+		foreach (var moduleInfo in _modules.Values)
+		{
+			if (!string.IsNullOrWhiteSpace(moduleName))
+			{
+				var candidateName = moduleInfo.ModuleName;
+				if (!string.Equals(candidateName, moduleName, StringComparison.OrdinalIgnoreCase)
+				    && !string.Equals(Path.GetFileNameWithoutExtension(candidateName), moduleName, StringComparison.OrdinalIgnoreCase))
+				{
+					continue;
+				}
+			}
+
+			var (token, resolved) = TryResolveMethodTokenInModule(moduleInfo, requestedType, requestedMethod);
+			if (resolved)
+				return (moduleInfo, token);
+		}
+
+		return (null, 0);
+	}
+
+	/// <summary>
+	/// Try to resolve a method token in a specific module by type and method name.
+	/// </summary>
+	private (int Token, bool Resolved) TryResolveMethodTokenInModule(ModuleInfo moduleInfo, string requestedType, string requestedMethod)
+	{
+		var assemblyPath = moduleInfo.ModulePath;
+		if (string.IsNullOrEmpty(assemblyPath) || !File.Exists(assemblyPath))
+			return (0, false);
+
+		try
+		{
+			using var file = new ICSharpCode.Decompiler.Metadata.PEFile(assemblyPath, PEStreamOptions.PrefetchMetadata);
+			var reader = file.Metadata;
+			var comparer = StringComparison.OrdinalIgnoreCase;
+
+			foreach (var typeHandle in reader.TypeDefinitions)
+			{
+				var typeDef = reader.GetTypeDefinition(typeHandle);
+				var typeName = reader.GetString(typeDef.Name);
+				var ns = reader.GetString(typeDef.Namespace);
+				var fullTypeName = string.IsNullOrEmpty(ns) ? typeName : $"{ns}.{typeName}";
+
+				if (!string.Equals(fullTypeName, requestedType, comparer)
+				    && !string.Equals(typeName, requestedType, comparer))
+				{
+					continue;
+				}
+
+				foreach (var methodHandle in typeDef.GetMethods())
+				{
+					var methodDef = reader.GetMethodDefinition(methodHandle);
+					var name = reader.GetString(methodDef.Name);
+					if (string.Equals(name, requestedMethod, comparer))
+					{
+						return (MetadataTokens.GetToken(methodHandle), true);
+					}
+				}
+			}
+		}
+		catch (Exception ex)
+		{
+			_logger?.Invoke($"Error resolving method token in {assemblyPath}: {ex.Message}");
+		}
+
+		return (0, false);
+	}
+
+	/// <summary>
 	/// Try to bind all pending breakpoints (called when a new module is loaded)
 	/// </summary>
 	private void TryBindPendingBreakpoints()
@@ -312,6 +473,55 @@ public partial class ManagedDebugger
 		}
 	}
 
+	/// <summary>
+	/// Get a summary of all loaded modules.
+	/// </summary>
+	public List<(string Name, string Path, string BaseAddress, bool IsUserCode, bool HasSymbols)> GetModules()
+	{
+		return _modules.Values
+			.Select(m => (m.ModuleName, m.ModulePath, m.BaseAddress.ToString(), m.IsUserCode, m.SymbolReader is not null))
+			.ToList();
+	}
+
+	/// <summary>
+	/// Get all source files referenced in the PDBs of user modules.
+	/// </summary>
+	public List<string> GetSourceFiles()
+	{
+		var files = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+		foreach (var module in _modules.Values.Where(m => m.IsUserCode))
+		{
+			if (module.SymbolReader is null)
+				continue;
+
+			foreach (var file in module.SymbolReader.GetSourceFiles())
+			{
+				if (IsGeneratedSourcePath(file))
+					continue;
+
+				files.Add(file);
+			}
+		}
+
+		return files.OrderBy(f => f, StringComparer.OrdinalIgnoreCase).ToList();
+	}
+
+	private static bool IsGeneratedSourcePath(string path)
+	{
+		// Skip build-generated files under obj/bin and compiler-generated suffixes.
+		var segments = path.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+		if (segments.Any(s =>
+			s.Equals("obj", StringComparison.OrdinalIgnoreCase) ||
+			s.Equals("bin", StringComparison.OrdinalIgnoreCase)))
+		{
+			return true;
+		}
+
+		var fileName = Path.GetFileName(path);
+		return fileName.EndsWith(".g.cs", StringComparison.OrdinalIgnoreCase) ||
+			fileName.EndsWith(".AssemblyAttributes.cs", StringComparison.OrdinalIgnoreCase);
+	}
+
 	// Not intended to implement IDisposable - it is intended that this is called via Disconnect()
 	private void Dispose()
 	{
@@ -349,6 +559,7 @@ public partial class ManagedDebugger
 
 		_isAttached = false;
 		_process = null;
+		_processId = 0;
 		_corDebug = null;
 	}
 }

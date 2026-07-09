@@ -35,7 +35,8 @@ public partial class ManagedDebugger
 				Value = value,
 				Type = friendlyTypeName,
 				PresentationHint = variablePresentationHint,
-				VariablesReference = GetVariablesReference(localVariableCorDebugValue, friendlyTypeName, threadId, stackDepth, debuggerProxyInstance)
+				VariablesReference = GetVariablesReference(localVariableCorDebugValue, friendlyTypeName, threadId, stackDepth, debuggerProxyInstance),
+				IsArgument = false
 			};
 			result.Add(variableInfo);
 		}
@@ -104,8 +105,9 @@ public partial class ManagedDebugger
 					Value = value,
 					Type = friendlyTypeName,
 					PresentationHint = variablePresentationHint,
-					VariablesReference = GetVariablesReference(implicitThisValue, friendlyTypeName, threadId, stackDepth, debuggerProxyInstance)
-				};
+					VariablesReference = GetVariablesReference(implicitThisValue, friendlyTypeName, threadId, stackDepth, debuggerProxyInstance),
+				IsArgument = false
+			};
 				result.Add(variableInfo);
 			}
 		}
@@ -126,7 +128,8 @@ public partial class ManagedDebugger
 				Value = value,
 				Type = friendlyTypeName,
 				PresentationHint = variablePresentationHint,
-				VariablesReference = GetVariablesReference(argumentCorDebugValue, friendlyTypeName, threadId, stackDepth, debuggerProxyInstance)
+				VariablesReference = GetVariablesReference(argumentCorDebugValue, friendlyTypeName, threadId, stackDepth, debuggerProxyInstance),
+				IsArgument = true
 			};
 			result.Add(variableInfo);
 		}

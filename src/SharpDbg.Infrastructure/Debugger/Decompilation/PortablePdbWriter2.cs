@@ -400,7 +400,7 @@ public class PortablePdbWriter2
 		return builder.MoveToImmutable();
 	}
 
-	static string SyntaxTreeToString(SyntaxTree syntaxTree, DecompilerSettings settings)
+	internal static string SyntaxTreeToString(SyntaxTree syntaxTree, DecompilerSettings settings)
 	{
 		StringWriter w = new StringWriter();
 		TokenWriter tokenWriter = new TextWriterTokenWriter(w);
