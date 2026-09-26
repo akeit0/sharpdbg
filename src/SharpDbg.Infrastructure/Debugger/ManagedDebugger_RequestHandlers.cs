@@ -54,10 +54,10 @@ public partial class ManagedDebugger
 		// Initialize DbgShim
 		var dbgshim = new DbgShim(NativeLibrary.Load("dbgshim", typeof(ManagedDebugger).Assembly, null));
 
+		var isDll = Path.GetExtension(launchInfo.Program).Equals(".dll", StringComparison.OrdinalIgnoreCase);
 		var processStartInfo = new ProcessStartInfo
 		{
-			FileName = "dotnet",
-			ArgumentList = { launchInfo.Program },
+			FileName = isDll ? "dotnet" : launchInfo.Program,
 			WorkingDirectory = launchInfo.Cwd ?? Environment.CurrentDirectory,
 			UseShellExecute = false,
 			CreateNoWindow = true,
@@ -65,6 +65,8 @@ public partial class ManagedDebugger
 			RedirectStandardError = true,
 			RedirectStandardInput = false,
 		};
+		if (isDll)
+			processStartInfo.ArgumentList.Add(launchInfo.Program);
 		foreach (var arg in launchInfo.Arguments)
 		{
 			processStartInfo.ArgumentList.Add(arg);
