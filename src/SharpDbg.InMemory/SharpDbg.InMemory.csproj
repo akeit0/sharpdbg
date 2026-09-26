@@ -11,7 +11,7 @@
 	<Authors>MattParkerDev</Authors>
 	<PackageLicenseExpression>MIT</PackageLicenseExpression>
 	<PackageReadmeFile>readme.md</PackageReadmeFile>
-	<PackageVersion>0.1.4</PackageVersion>
+	<PackageVersion>0.1.17</PackageVersion>
 	<PackageProjectUrl>https://github.com/MattParkerDev/sharpdbg</PackageProjectUrl>
 	<Description>A managed .NET Debugger implementing the Debug Adapter Protocol</Description>
 	<PackageTags>Csharp Dotnet Debugger Debugging ICorDebug</PackageTags>
@@ -31,10 +31,13 @@
 		<PackageReference Include="Microsoft.Diagnostics.DbgShim" Version="9.0.661903" />
 
 		<!-- We must include all package references required by projects that we reference -->
-		<PackageReference Include="Microsoft.VisualStudio.Shared.VSCodeDebugProtocol" Version="18.0.10427.1" />
 		<PackageReference Include="Ardalis.GuardClauses" Version="5.0.0" />
-		<PackageReference Include="ClrDebug" Version="0.3.4" />
-		<PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.3.0" />
+		<PackageReference Include="ICorDebugSharp" Version="0.1.8" />
+		<PackageReference Include="ICSharpCode.Decompiler" Version="11.0.0.9375" />
+		<PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.9.0" />
+		<PackageReference Include="Microsoft.Diagnostics.NETCore.Client" Version="0.2.661903" />
+		<PackageReference Include="Microsoft.VisualStudio.Shared.VSCodeDebugProtocol" Version="18.0.10427.1" />
+		<PackageReference Include="MP.Microsoft.CodeAnalysis.CSharp.ExpressionEvaluator.ExpressionCompiler" Version="5.9.0" />
 		<PackageReference Include="NeoSmart.AsyncLock" Version="3.2.1" />
 		<PackageReference Include="ZLinq" Version="1.5.6" />
 	</ItemGroup>

@@ -1,13 +1,11 @@
 using Ardalis.GuardClauses;
-using ClrDebug;
+using ICorDebugSharp;
 using NeoSmart.AsyncLock;
-using SharpDbg.Infrastructure.Debugger.ExpressionEvaluator.Interpreter;
 
 namespace SharpDbg.Infrastructure.Debugger;
 
 public class AsyncStepper
 {
-	private readonly CorDebugManagedCallback _managedCallback;
 	private readonly ManagedDebugger _debugger;
 	private enum AsyncStepStatus
 	{
@@ -24,7 +22,7 @@ public class AsyncStepper
 
 	private class AsyncBreakpoint
 	{
-		public CorDebugFunctionBreakpoint? Breakpoint;
+		public ICorDebugFunctionBreakpoint? Breakpoint;
 		public CORDB_ADDRESS ModuleAddress;
 		public mdMethodDef MethodToken;
 		public uint ILOffset;
@@ -54,7 +52,7 @@ public class AsyncStepper
 		public uint ResumeOffset;
 		public AsyncStepStatus Status;
 		public AsyncBreakpoint? Breakpoint;
-		public CorDebugHandleValue? AsyncIdHandle; // Strong handle to builder's ObjectIdForDebugger
+		public ICorDebugHandleValue? AsyncIdHandle; // Strong handle to builder's ObjectIdForDebugger
 
 		public void Dispose()
 		{
@@ -75,17 +73,16 @@ public class AsyncStepper
 	private AsyncBreakpoint? _notifyDebuggerBreakpoint;
 	private readonly AsyncLock _lock2 = new AsyncLock();
 
-	public AsyncStepper(Dictionary<CORDB_ADDRESS, ModuleInfo> modules, CorDebugManagedCallback managedCallback, ManagedDebugger debugger)
+	public AsyncStepper(Dictionary<CORDB_ADDRESS, ModuleInfo> modules, ManagedDebugger debugger)
 	{
 		_modules = modules;
-		_managedCallback = managedCallback;
 		_debugger = debugger;
 	}
 
 	/// <summary>
 	/// Call SetNotificationForWaitCompletion on the async builder
 	/// </summary>
-	private async Task<bool> SetNotificationForWaitCompletion(CorDebugValue builder, CorDebugILFrame? frame, CorDebugThread thread)
+	private async Task<bool> SetNotificationForWaitCompletion(ICorDebugValue builder, ICorDebugILFrame? frame, ICorDebugThread thread)
 	{
 		try
 		{
@@ -95,20 +92,20 @@ public class AsyncStepper
 			var boolValue = eval.NewBooleanValue(true);
 
 			// Find SetNotificationForWaitCompletion method
-			var function = CompiledExpressionInterpreter.FindMethodOnType(objectValue.ExactType, "SetNotificationForWaitCompletion", [boolValue], false, false);
+			var function = _debugger.FindMethodOnType(objectValue.ExactType, "SetNotificationForWaitCompletion", [boolValue], false, false);
 			Guard.Against.Null(function);
 
 			// Call builder.SetNotificationForWaitCompletion(true)
-			var typeParameterArgs = objectValue.ExactType.TypeParameters.Select(t => t.Raw).ToArray();
+			var typeParameterArgs = objectValue.ExactType.TypeParameters;
 			// result should be null, as SetNotificationForWaitCompletion returns void
 			var result = await eval.CallParameterizedFunctionAsync(
-				_managedCallback,
+				_debugger.ProcessRuntimeEventsUntilEvalEvent,
 				_debugger.EvalStatus,
 				function,
 				typeParameterArgs.Length,
 				typeParameterArgs,
 				2,
-				[builder.Raw, boolValue.Raw]
+				[builder, boolValue]
 			);
 			if (result is not null) throw new InvalidOperationException("SetNotificationForWaitCompletion returned a value when void was expected");
 			return true;
@@ -122,7 +119,7 @@ public class AsyncStepper
 	/// <summary>
 	/// Setup breakpoint in Task.NotifyDebuggerOfWaitCompletion method
 	/// </summary>
-	private bool SetupNotifyDebuggerOfWaitCompletionBreakpoint(CorDebugThread thread)
+	private bool SetupNotifyDebuggerOfWaitCompletionBreakpoint(ICorDebugThread thread)
 	{
 		try
 		{
@@ -131,7 +128,7 @@ public class AsyncStepper
 			const string methodName = "NotifyDebuggerOfWaitCompletion";
 
 			// Find the module
-			CorDebugModule? targetModule = null;
+			ICorDebugModule? targetModule = null;
 			foreach (var module in _modules.Values)
 			{
 				if (module.Module.Name.EndsWith(assemblyName, StringComparison.OrdinalIgnoreCase))
@@ -145,7 +142,7 @@ public class AsyncStepper
 				return false;
 
 			// TODO: This doesn't need to be looked up every time
-			var metadataImport = targetModule.GetMetaDataInterface().MetaDataImport;
+			var metadataImport = targetModule.GetMetaDataInterface<IMetaDataImport>();
 			var classDef = metadataImport.FindTypeDefByNameOrNull(className, mdToken.Nil);
 			if (classDef is null) return false;
 
@@ -180,7 +177,7 @@ public class AsyncStepper
 	/// <param name="stepType">Type of step</param>
 	/// <param name="shouldUseSimpleStepper">Output: whether to use simple stepper</param>
 	/// <returns>True if async stepping was initiated, false otherwise</returns>
-	public async Task<(bool HandledByAsyncStepper, bool? ShouldUseSimpleStepper)> TrySetupAsyncStep(CorDebugThread thread, StepType stepType)
+	public async Task<(bool HandledByAsyncStepper, bool? ShouldUseSimpleStepper)> TrySetupAsyncStep(ICorDebugThread thread, StepType stepType)
 	{
 		try
 		{
@@ -188,20 +185,20 @@ public class AsyncStepper
 			if (frame is null) return (false, null);
 
 			var function = frame.Function;
-			var moduleAddress = (long)function.Module.BaseAddress;
+			var moduleAddress = function.Module.BaseAddress;
 			var methodToken = function.Token;
 			var ilCode = function.ILCode;
 			var methodVersion = ilCode.VersionNumber;
 
 			// Check if module has symbols
-			if (!_modules.TryGetValue(moduleAddress, out var moduleInfo) || moduleInfo.SymbolReader is null)
+			if (!_modules.TryGetValue(moduleAddress, out var moduleInfo) || moduleInfo.MetadataReader.HasSymbols is false)
 				return (false, null);
 
 			// Check if method has async stepping info
-			var asyncInfo = moduleInfo.SymbolReader.GetAsyncMethodSteppingInfo(methodToken);
+			var asyncInfo = moduleInfo.MetadataReader.GetAsyncMethodSteppingInfo(methodToken);
 			if (asyncInfo is null) return (false, null);
 
-			var ilFrame = frame as CorDebugILFrame;
+			var ilFrame = frame as ICorDebugILFrame;
 
 			// Check if we're at the end of an async method and need step-out behavior
 			if (stepType != StepType.StepOut)
@@ -243,7 +240,7 @@ public class AsyncStepper
 						}
 
 						// Not async void - use NotifyDebuggerOfWaitCompletion magic
-						var success = await SetNotificationForWaitCompletion(builder, frame as CorDebugILFrame, thread);
+						var success = await SetNotificationForWaitCompletion(builder, frame as ICorDebugILFrame, thread);
 						if (success)
 						{
 							// Setup breakpoint in Task.NotifyDebuggerOfWaitCompletion
@@ -312,7 +309,7 @@ public class AsyncStepper
 	/// <param name="breakpoint">Breakpoint that was hit</param>
 	/// <param name="shouldStop">Output: whether execution should stop</param>
 	/// <returns>True if breakpoint was handled by async stepper</returns>
-	public async Task<(bool HandledByAsyncStepper, bool? ShouldStop)> TryHandleBreakpoint(CorDebugThread thread, CorDebugFunctionBreakpoint breakpoint)
+	public async Task<(bool HandledByAsyncStepper, bool? ShouldStop)> TryHandleBreakpoint(ICorDebugThread thread, ICorDebugFunctionBreakpoint breakpoint)
 	{
 		using (await _lock2.LockAsync())
 		{
@@ -320,11 +317,12 @@ public class AsyncStepper
 			if (_notifyDebuggerBreakpoint is not null &&
 				MatchesBreakpoint(breakpoint, _notifyDebuggerBreakpoint, thread))
 			{
-				// NotifyDebuggerOfWaitCompletion was hit - this is for step-out
+				// The task-completion hook was hit during an async step-out operation.
 				_notifyDebuggerBreakpoint?.Dispose();
 				_notifyDebuggerBreakpoint = null;
 
-				// Continue with normal step-out
+				// Let the breakpoint handler step into the runtime hook to reach
+				// the awaiting continuation's next user-code location.
 				return (true, true);
 			}
 
@@ -342,7 +340,7 @@ public class AsyncStepper
 			}
 
 			// Check if IP matches expected offset
-			var frame = thread.ActiveFrame as CorDebugILFrame;
+			var frame = thread.ActiveFrame as ICorDebugILFrame;
 			if (frame is null)
 			{
 				_currentAsyncStep?.Dispose();
@@ -378,7 +376,7 @@ public class AsyncStepper
 		return (false, null);
 	}
 
-	private async Task<(bool HandledByAsyncStepper, bool? ShouldStop)> HandleYieldBreakpoint(CorDebugThread thread, CorDebugILFrame frame)
+	private async Task<(bool HandledByAsyncStepper, bool? ShouldStop)> HandleYieldBreakpoint(ICorDebugThread thread, ICorDebugILFrame frame)
 	{
 		// Disable all simple steppers when we hit the yield breakpoint
 		DisableAllSimpleSteppers(thread.Process);
@@ -411,7 +409,7 @@ public class AsyncStepper
 		return (true, false);
 	}
 
-	private async Task<(bool HandledByAsyncStepper, bool? ShouldStop)> HandleResumeBreakpoint(CorDebugThread thread)
+	private async Task<(bool HandledByAsyncStepper, bool? ShouldStop)> HandleResumeBreakpoint(ICorDebugThread thread)
 	{
 		// Check if this is the same thread
 		if (_currentAsyncStep!.ThreadId == thread.Id)
@@ -424,7 +422,7 @@ public class AsyncStepper
 		// Different thread - check async ID
 		else if (_currentAsyncStep!.AsyncIdHandle is not null)
 		{
-			var currentAsyncId = await GetAsyncIdReference((CorDebugILFrame)thread.ActiveFrame);
+			var currentAsyncId = await GetAsyncIdReference((ICorDebugILFrame)thread.ActiveFrame);
 			if (currentAsyncId is not null)
 			{
 				var currentAddress = currentAsyncId.Dereference().Address;
@@ -444,7 +442,7 @@ public class AsyncStepper
 		return (true, false);
 	}
 
-	private SymbolReader.AsyncAwaitInfo? FindNextAwaitInfo(SymbolReader.AsyncMethodSteppingInfo asyncInfo, uint currentOffset)
+	private ModuleMetadataReader.AsyncAwaitInfo? FindNextAwaitInfo(ModuleMetadataReader.AsyncMethodSteppingInfo asyncInfo, uint currentOffset)
 	{
 		foreach (var awaitInfo in asyncInfo.AwaitInfos)
 		{
@@ -461,7 +459,7 @@ public class AsyncStepper
 		return null;
 	}
 
-	private async Task<CorDebugHandleValue?> GetAsyncIdReference(CorDebugILFrame frame)
+	private async Task<ICorDebugHandleValue?> GetAsyncIdReference(ICorDebugILFrame frame)
 	{
 		Guard.Against.Null(frame);
 		var builder = GetAsyncBuilder(frame);
@@ -471,14 +469,14 @@ public class AsyncStepper
 		return objectId;
 	}
 
-	private CorDebugValue? GetAsyncBuilder(CorDebugILFrame frame)
+	private ICorDebugValue? GetAsyncBuilder(ICorDebugILFrame frame)
 	{
 		try
 		{
 			var function = frame.Function;
 			var module = function.Module;
 			var methodToken = function.Token;
-			var metadataImport = module.GetMetaDataInterface().MetaDataImport;
+			var metadataImport = module.GetMetaDataInterface<IMetaDataImport>();
 
 			var methodProps = metadataImport.GetMethodProps(methodToken);
 			var isStatic = (methodProps.pdwAttr & CorMethodAttr.mdStatic) != 0;
@@ -492,12 +490,12 @@ public class AsyncStepper
 				return null;
 
 			var thisValue = arguments[0];
-			var thisRefValue = thisValue as CorDebugReferenceValue;
+			var thisRefValue = thisValue as ICorDebugReferenceValue;
 			if (thisRefValue is null || thisRefValue.IsNull)
 				return null;
 
 			var thisValueUnwrapped = thisRefValue.Dereference();
-			var thisObjectValue = thisValueUnwrapped as CorDebugObjectValue;
+			var thisObjectValue = thisValueUnwrapped as ICorDebugObjectValue;
 			if (thisObjectValue is null)
 				return null;
 
@@ -506,7 +504,7 @@ public class AsyncStepper
 			if (fieldDef.IsNil)
 				return null;
 
-			var fieldValue = thisObjectValue.GetFieldValue(thisClass.Raw, fieldDef);
+			var fieldValue = thisObjectValue.GetFieldValue(thisClass, fieldDef);
 			var fieldValueUnwrapped = fieldValue.UnwrapDebugValue();
 			return fieldValueUnwrapped;
 		}
@@ -516,13 +514,13 @@ public class AsyncStepper
 		}
 	}
 
-	private async Task<CorDebugHandleValue?> GetObjectIdForDebugger(CorDebugValue builder, CorDebugILFrame frame)
+	private async Task<ICorDebugHandleValue?> GetObjectIdForDebugger(ICorDebugValue builder, ICorDebugILFrame frame)
 	{
 
 		var objectValue = builder.UnwrapDebugValueToObject();
 		var @class = objectValue.Class;
 		var module = @class.Module;
-		var metadataImport = module.GetMetaDataInterface().MetaDataImport;
+		var metadataImport = module.GetMetaDataInterface<IMetaDataImport>();
 
 		var propertyDef = metadataImport.GetPropertyWithName(@class.Token, "ObjectIdForDebugger");
 		if (propertyDef is null || propertyDef.Value.IsNil)
@@ -538,20 +536,20 @@ public class AsyncStepper
 
 		// Call ObjectIdForDebugger getter
 		var result = await eval.CallParameterizedFunctionAsync(
-			_managedCallback,
+			_debugger.ProcessRuntimeEventsUntilEvalEvent,
 			_debugger.EvalStatus,
 			getMethod,
 			builder.ExactType.TypeParameters.Length,
-			builder.ExactType.TypeParameters.Select(t => t.Raw).ToArray(),
+			builder.ExactType.TypeParameters,
 			1,
-			[builder.Raw]
+			[builder]
 		);
 
-		if (result is not CorDebugHandleValue handleValue) throw new InvalidOperationException("ObjectIdForDebugger is not a handle value");
+		if (result is not ICorDebugHandleValue handleValue) throw new InvalidOperationException("ObjectIdForDebugger is not a handle value");
 		return handleValue;
 	}
 
-	private bool MatchesBreakpoint(CorDebugFunctionBreakpoint breakpoint, AsyncBreakpoint asyncBp, CorDebugThread thread)
+	private bool MatchesBreakpoint(ICorDebugFunctionBreakpoint breakpoint, AsyncBreakpoint asyncBp, ICorDebugThread thread)
 	{
 		var frame = thread.ActiveFrame;
 		if (frame is null) return false;
@@ -560,13 +558,13 @@ public class AsyncStepper
 		var moduleAddress = function.Module.BaseAddress;
 		var methodToken = function.Token;
 
-		return moduleAddress == asyncBp.ModuleAddress && methodToken == asyncBp.MethodToken && breakpoint.Raw == asyncBp.Breakpoint?.Raw;
+		return moduleAddress == asyncBp.ModuleAddress && methodToken == asyncBp.MethodToken && breakpoint == asyncBp.Breakpoint;
 	}
 
 	/// <summary>
 	/// Disable all simple steppers across all app domains
 	/// </summary>
-	private void DisableAllSimpleSteppers(CorDebugProcess process)
+	private void DisableAllSimpleSteppers(ICorDebugProcess process)
 	{
 		var appDomains = process.EnumerateAppDomains();
 		foreach (var appDomain in appDomains)

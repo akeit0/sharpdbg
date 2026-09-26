@@ -7,6 +7,7 @@ using Microsoft.VisualStudio.Shared.VSCodeDebugProtocol.Messages;
 using Newtonsoft.Json.Linq;
 using SharpDbg.Infrastructure.Debugger.Models;
 using SharpDbg.Infrastructure.Debugger.Models.Response;
+using SharpDbg.Application.Protocol;
 using MSBreakpoint = Microsoft.VisualStudio.Shared.VSCodeDebugProtocol.Messages.Breakpoint;
 using MSThread = Microsoft.VisualStudio.Shared.VSCodeDebugProtocol.Messages.Thread;
 using MSStackFrame = Microsoft.VisualStudio.Shared.VSCodeDebugProtocol.Messages.StackFrame;
@@ -22,6 +23,13 @@ public class DebugAdapter : DebugAdapterBase
 	private readonly Action<string>? _logger;
 	private bool _clientLinesStartAt1 = true;
 	private bool _clientColumnsStartAt1 = true;
+	private int _shutdownRequested;
+
+	/// <summary>
+	/// Raised once the debug session has ended (a disconnect request has been fully handled).
+	/// Hosts which own the process lifetime (e.g. SharpDbg.Cli) should subscribe and exit when it fires.
+	/// </summary>
+	public event Action? ShutdownRequested;
 
 	public DebugAdapter(Action<string>? logger = null)
 	{
@@ -32,16 +40,72 @@ public class DebugAdapter : DebugAdapterBase
 		SubscribeToDebuggerEvents();
 	}
 
-	public void Initialize(Stream input, Stream output)
+	/// <summary>
+	/// Signals the end of the debug session and raises <see cref="ShutdownRequested"/> so the hosting
+	/// process can shut down. Idempotent.
+	/// Only called once a 'disconnect' request has been fully handled - 'terminate' must keep the adapter alive.
+	/// </summary>
+	private void RequestDebuggerProcessShutdown()
 	{
-		InitializeProtocolClient(input, output);
+		if (Interlocked.Exchange(ref _shutdownRequested, 1) is not 0) return;
+
+		_logger?.Invoke("RequestDebuggerProcessShutdown");
+		ShutdownRequested?.Invoke();
 	}
 
-	private static T ExecuteWithExceptionHandling<T>(Func<T> func)
+	/// <summary>
+	/// Releases debugger resources when the session ends without a disconnect request having been received
+	/// (e.g. the client crashed or closed its stream)
+	/// </summary>
+	public void DapAborted_ShutdownDebugger()
 	{
 		try
 		{
-			return func();
+			// No-op if a disconnect request was already handled - Disconnect only disposes once
+			_debugger.Disconnect(true);
+		}
+		catch { /* */ }
+	}
+
+	public void Initialize(Stream input, Stream output)
+	{
+		InitializeProtocolClient(input, output, Microsoft.VisualStudio.Shared.VSCodeDebugProtocol.Protocol.DebugProtocolOptions.AllowWildcardRegistrations);
+		Protocol.RemoveRequestRegistration("vsCustomMessage");
+		Protocol.RegisterRequestType<VsCustomMessageRequest, VsCustomMessageArguments, VsCustomMessageResponse>(responder =>
+		{
+			responder.SetResponse(new VsCustomMessageResponse());
+		});
+		Protocol.RegisterRequestType<ResolveStackFrameRequest, ResolveStackFrameArguments, ResolveStackFrameResponse>(HandleResolveStackFrameRequestAsync);
+		Protocol.RegisterRequestType<UnsupportedRequest, JObject, UnsupportedResponse>(responder =>
+		{
+			responder.SetError(new ProtocolException($"Request '{responder.Command}' is not supported."));
+		});
+	}
+
+	private sealed class UnsupportedRequest() : DebugRequestWithResponse<JObject, UnsupportedResponse>("*");
+	private sealed class UnsupportedResponse : ResponseBody;
+
+	protected override ResponseBody HandleProtocolRequest(string requestType, object requestArgs)
+	{
+		try
+		{
+			return base.HandleProtocolRequest(requestType, requestArgs);
+		}
+		catch (NotImplementedException ex)
+		{
+			throw new ProtocolException($"Request '{requestType}' is not supported.", ex);
+		}
+	}
+
+	private async Task<T> ExecuteWithExceptionHandling<T>(Func<T> func)
+	{
+		try
+		{
+			using (await _debugger.DapRequestAndRuntimeEventLock.LockAsync())
+			{
+				await _debugger.DrainRuntimeEventQueue();
+				return func();
+			}
 		}
 		catch (ProtocolException)
 		{
@@ -50,6 +114,42 @@ public class DebugAdapter : DebugAdapterBase
 		catch (Exception ex)
 		{
 			throw new ProtocolException(ex.Message, ex);
+		}
+	}
+
+	private async Task<T> ExecuteWithDebuggerProcessingLockAsync<T>(Func<Task<T>> func)
+	{
+		using (await _debugger.DapRequestAndRuntimeEventLock.LockAsync())
+		{
+			await _debugger.DrainRuntimeEventQueue();
+			return await func().ConfigureAwait(false);
+		}
+	}
+
+	private async Task ExecuteWithDebuggerProcessingLockAsync(Func<Task> func)
+	{
+		using (await _debugger.DapRequestAndRuntimeEventLock.LockAsync())
+		{
+			await _debugger.DrainRuntimeEventQueue();
+			await func().ConfigureAwait(false);
+		}
+	}
+
+	private async Task<T> ExecuteWithDebuggerProcessingLockAsync<T>(Func<T> func)
+	{
+		using (await _debugger.DapRequestAndRuntimeEventLock.LockAsync())
+		{
+			await _debugger.DrainRuntimeEventQueue();
+			return func();
+		}
+	}
+
+	private async Task ExecuteWithDebuggerProcessingLockAsync(Action func)
+	{
+		using (await _debugger.DapRequestAndRuntimeEventLock.LockAsync())
+		{
+			await _debugger.DrainRuntimeEventQueue();
+			func();
 		}
 	}
 
@@ -75,19 +175,19 @@ public class DebugAdapter : DebugAdapterBase
 			});
 		};
 
-		_debugger.OnStopped2 += (threadId, filePath, line, column, reason, decompiledSourceInfo, _) =>
+		_debugger.OnStopped2 += (threadId, filePath, line, column, reason, hitBreakpointIds) =>
 		{
 			var source = new Source { Path = filePath };
 			var stoppedEvent = new StoppedEvent
 			{
 				Reason = ConvertStopReason(reason),
 				ThreadId = threadId,
-				AllThreadsStopped = true
+				AllThreadsStopped = true,
+				HitBreakpointIds = hitBreakpointIds
 			};
 			stoppedEvent.AdditionalProperties["source"] = JToken.FromObject(source);
 			stoppedEvent.AdditionalProperties["line"] = JToken.FromObject(line);
 			stoppedEvent.AdditionalProperties["column"] = JToken.FromObject(column);
-			stoppedEvent.AdditionalProperties["decompiledSourceInfo"] = decompiledSourceInfo is null ? null : JToken.FromObject(decompiledSourceInfo);
 			Protocol.SendEvent(stoppedEvent);
 		};
 
@@ -100,13 +200,13 @@ public class DebugAdapter : DebugAdapterBase
 				{
 					Id = breakpoint.Id,
 					Verified = breakpoint.Verified,
-					Line = ConvertDebuggerLineToClient(breakpoint.Line),
-					Column = breakpoint is { Verified: true, Column: not null } ? ConvertDebuggerColumnToClient(breakpoint.Column.Value) : null,
-					EndLine = breakpoint.Verified ? breakpoint.EndLine : null,
-					EndColumn = breakpoint is { Verified: true, EndColumn: not null } ? ConvertDebuggerColumnToClient(breakpoint.EndColumn.Value) : null,
-					Offset = breakpoint.Verified ? 0 : null,
+					Line = breakpoint.IsFunctionBreakpoint ? null : ConvertDebuggerLineToClient(breakpoint.Line),
+					Column = breakpoint is { IsFunctionBreakpoint: false, Verified: true, Column: not null } ? ConvertDebuggerColumnToClient(breakpoint.Column.Value) : null,
+					EndLine = breakpoint is { IsFunctionBreakpoint: false, Verified: true } ? ConvertDebuggerLineToClient(breakpoint.EndLine) : null,
+					EndColumn = breakpoint is { IsFunctionBreakpoint: false, Verified: true, EndColumn: not null } ? ConvertDebuggerColumnToClient(breakpoint.EndColumn.Value) : null,
+					Offset = breakpoint is { IsFunctionBreakpoint: false, Verified: true } ? 0 : null,
 					Message = breakpoint.Message,
-					Source = breakpoint.Verified is false ? null : new Source
+					Source = breakpoint is not { IsFunctionBreakpoint: false, Verified: true } ? null : new Source
 					{
 						Path = breakpoint.FilePath,
 						Name = Path.GetFileName(breakpoint.FilePath),
@@ -125,11 +225,12 @@ public class DebugAdapter : DebugAdapterBase
 			});
 		};
 
-		_debugger.OnExited += () =>
+		_debugger.OnExited += exitCode =>
 		{
+			// exitCode will be null in the attach scenario, as we cannot obtain the exit code of the process we attached to
 			Protocol.SendEvent(new ExitedEvent
 			{
-				ExitCode = 0 // There is no built-in, cross-platform way to get the exit code of an exited process
+				ExitCode = exitCode ?? 0
 			});
 		};
 
@@ -138,7 +239,7 @@ public class DebugAdapter : DebugAdapterBase
 			Protocol.SendEvent(new TerminatedEvent());
 		};
 
-		_debugger.OnThreadStarted += (threadId, name) =>
+		_debugger.OnThreadStarted += threadId =>
 		{
 			Protocol.SendEvent(new ThreadEvent
 			{
@@ -147,7 +248,7 @@ public class DebugAdapter : DebugAdapterBase
 			});
 		};
 
-		_debugger.OnThreadExited += (threadId, name) =>
+		_debugger.OnThreadExited += threadId =>
 		{
 			Protocol.SendEvent(new ThreadEvent
 			{
@@ -169,30 +270,42 @@ public class DebugAdapter : DebugAdapterBase
 				}
 			});
 		};
-
-		_debugger.OnOutput += (output) =>
+		_debugger.OnModuleUnloaded += (id, name, path) =>
 		{
-			Protocol.SendEvent(new OutputEvent
+			Protocol.SendEvent(new ModuleEvent
 			{
-				Category = OutputEvent.CategoryValue.Stdout,
-				Output = output
+				Reason = ModuleEvent.ReasonValue.Removed,
+				Module = new Module
+				{
+					Id = id,
+					Name = name,
+					Path = path
+				}
 			});
 		};
-		_debugger.OnTargetOutput += (channel, output) =>
+
+		_debugger.OnProcessStarted += (processId, name) =>
+		{
+			Protocol.SendEvent(new ProcessEvent
+			{
+				Name = name,
+				SystemProcessId = processId,
+				StartMethod = ProcessEvent.StartMethodValue.Launch,
+				IsLocalProcess = true
+			});
+		};
+
+		_debugger.OnOutput += (output, isStdError) =>
 		{
 			Protocol.SendEvent(new OutputEvent
 			{
-				Category = channel switch
-				{
-					"stderr" => OutputEvent.CategoryValue.Stderr,
-					"debug" => OutputEvent.CategoryValue.Console,
-					_ => OutputEvent.CategoryValue.Stdout
-				},
-				Output = output + Environment.NewLine
+				Category = isStdError ? OutputEvent.CategoryValue.Stderr : OutputEvent.CategoryValue.Stdout,
+				Output = output
 			});
 		};
 		_debugger.SendRunInTerminalRequest += launchInfo =>
 		{
+			var programForTitle = launchInfo.Program is "dotnet" ? launchInfo.Arguments[0] : launchInfo.Program;
 			var runInTerminalRequest = new RunInTerminalRequest
 			{
 				Kind = launchInfo.LaunchRequestConsoleType switch
@@ -201,10 +314,10 @@ public class DebugAdapter : DebugAdapterBase
 					LaunchRequestConsoleType.ExternalTerminal => RunInTerminalArguments.KindValue.External,
 					_ => throw new ArgumentOutOfRangeException(nameof(launchInfo.LaunchRequestConsoleType), $"Invalid LaunchRequestConsoleType for RunInTerminalRequest: '{launchInfo.LaunchRequestConsoleType}'")
 				},
-				Arguments = ["dotnet", launchInfo.Program, ..launchInfo.Arguments],
+				Arguments = [launchInfo.Program, ..launchInfo.Arguments],
 				Cwd = launchInfo.Cwd,
 				Env = launchInfo.Env.ToDictionary(kvp => kvp.Key, kvp => (object)kvp.Value),
-				Title = $"{Path.GetFileName(launchInfo.Program)} [DEBUG]"
+				Title = $"{Path.GetFileName(programForTitle)} [DEBUG]"
 			};
 			runInTerminalRequest.Env["DOTNET_DefaultDiagnosticPortSuspend"] = "1";
 			var resp = Protocol.SendClientRequestSync(runInTerminalRequest);
@@ -222,6 +335,7 @@ public class DebugAdapter : DebugAdapterBase
 		_clientColumnsStartAt1 = arguments.ColumnsStartAt1 ?? true;
 
 		// Send initialized event
+		// This event MUST be sent after the InitializeResponse. We achieve that currently because DebugAdapter queues events for synchronous handlers such as this one.
 		Protocol.SendEvent(new InitializedEvent());
 
 		return new InitializeResponse
@@ -236,6 +350,7 @@ public class DebugAdapter : DebugAdapterBase
 			SupportsRestartFrame = false,
 			SupportsTerminateRequest = true,
 			SupportsExceptionInfoRequest = true,
+			SupportsExceptionFilterOptions = true,
 			SupportsStepInTargetsRequest = false,
 			SupportsGotoTargetsRequest = false,
 			ExceptionBreakpointFilters =
@@ -246,10 +361,11 @@ public class DebugAdapter : DebugAdapterBase
 		};
 	}
 
-	protected override LaunchResponse HandleLaunchRequest(LaunchArguments arguments)
+	protected override async void HandleLaunchRequestAsync(IRequestResponder<LaunchArguments> responder)
 	{
-		return ExecuteWithExceptionHandling(() =>
+		try
 		{
+			var arguments = responder.Arguments;
 			var program = GetConfigValue<string>(arguments.ConfigurationProperties, "program");
 			if (string.IsNullOrEmpty(program))
 			{
@@ -270,6 +386,11 @@ public class DebugAdapter : DebugAdapterBase
 				null => LaunchRequestConsoleType.InternalConsole, // Default to internalConsole if not specified
 				_ => throw new ArgumentOutOfRangeException(nameof(console), $"Invalid console type: '{console}'")
 			};
+
+			(program, args) = Path.GetExtension(program).Equals(".dll", StringComparison.OrdinalIgnoreCase)
+				? ("dotnet", [program, ..args])
+				: (program, args);
+
 			var launchInfo = new LaunchInfo
 			{
 				Program = program,
@@ -280,23 +401,21 @@ public class DebugAdapter : DebugAdapterBase
 				LaunchRequestConsoleType = launchRequestConsoleType
 			};
 
-			try
-			{
-				_debugger.Launch(launchInfo, justMyCode);
-				return new LaunchResponse();
-			}
-			catch (Exception ex)
-			{
-				_logger?.Invoke($"Launch failed: {ex.Message}");
-				throw new ProtocolException($"Failed to launch: {ex.Message}");
-			}
-		});
+			await ExecuteWithDebuggerProcessingLockAsync(async () => _debugger.Launch(launchInfo, justMyCode));
+			responder.SetResponse(new LaunchResponse());
+		}
+		catch (Exception ex)
+		{
+			_logger?.Invoke($"HandleLaunchRequestAsync failed: {ex.Message} , {ex}");
+			responder.SetError(new ProtocolException($"Failed to launch: {ex.Message}", ex));
+		}
 	}
 
-	protected override AttachResponse HandleAttachRequest(AttachArguments arguments)
+	protected override async void HandleAttachRequestAsync(IRequestResponder<AttachArguments> responder)
 	{
-		return ExecuteWithExceptionHandling(() =>
+		try
 		{
+			var arguments = responder.Arguments;
 			RemoteAttachInfo? remoteAttachInfo = null;
 			var processId = GetConfigValue<int?>(arguments.ConfigurationProperties, "processId");
 			if (processId is null)
@@ -325,18 +444,18 @@ public class DebugAdapter : DebugAdapterBase
 				};
 			}
 			var justMyCode = GetConfigValue<bool?>(arguments.ConfigurationProperties, "justMyCode") ?? true;
-			try
+			await ExecuteWithDebuggerProcessingLockAsync(async () =>
 			{
 				if (remoteAttachInfo is null) _debugger.Attach(processId.Value, justMyCode);
 				else _debugger.AttachRemote(remoteAttachInfo, justMyCode);
-				return new AttachResponse();
-			}
-			catch (Exception ex)
-			{
-				_logger?.Invoke($"Attach failed: {ex.Message}");
-				throw new ProtocolException($"Failed to attach: {ex.Message}");
-			}
-		});
+			});
+			responder.SetResponse(new AttachResponse());
+		}
+		catch (Exception ex)
+		{
+			_logger?.Invoke($"HandleAttachRequestAsync failed: {ex.Message} , {ex}");
+			responder.SetError(new ProtocolException($"Failed to attach: {ex.Message}", ex));
+		}
 	}
 
 	protected override async void HandleConfigurationDoneRequestAsync(IRequestResponder<ConfigurationDoneArguments> responder)
@@ -344,7 +463,7 @@ public class DebugAdapter : DebugAdapterBase
 		try
 		{
 			_logger?.Invoke("Configuration done");
-			await _debugger.ConfigurationDone();
+			await ExecuteWithDebuggerProcessingLockAsync(() => _debugger.ConfigurationDone());
 			responder.SetResponse(new ConfigurationDoneResponse());
 		}
 		catch (Exception ex)
@@ -354,10 +473,11 @@ public class DebugAdapter : DebugAdapterBase
 		}
 	}
 
-	protected override SetBreakpointsResponse HandleSetBreakpointsRequest(SetBreakpointsArguments arguments)
+	protected override async void HandleSetBreakpointsRequestAsync(IRequestResponder<SetBreakpointsArguments, SetBreakpointsResponse> responder)
 	{
-		return ExecuteWithExceptionHandling(() =>
+		try
 		{
+			var arguments = responder.Arguments;
 			if (arguments.Source?.Path is null)
 			{
 				throw new ProtocolException("Missing source path");
@@ -371,7 +491,7 @@ public class DebugAdapter : DebugAdapterBase
 					bp.Column is null ? null : ConvertClientColumnToDebugger(bp.Column.Value)))
 				.ToArray() ?? [];
 
-			var breakpoints = _debugger.SetBreakpoints(arguments.Source.Path, breakpointRequests);
+			var breakpoints = await ExecuteWithDebuggerProcessingLockAsync(async () => _debugger.SetBreakpoints(arguments.Source.Path, breakpointRequests));
 
 			var responseBreakpoints = breakpoints.Select(bp => new MSBreakpoint
 			{
@@ -379,7 +499,7 @@ public class DebugAdapter : DebugAdapterBase
 				Verified = bp.Verified,
 				Line = ConvertDebuggerLineToClient(bp.Line),
 				Column = bp is { Verified: true, Column: not null } ? ConvertDebuggerColumnToClient(bp.Column.Value) : null,
-				EndLine = bp.Verified ? bp.EndLine : null,
+				EndLine = bp.Verified ? ConvertDebuggerLineToClient(bp.EndLine) : null,
 				EndColumn = bp is { Verified: true, EndColumn: not null } ? ConvertDebuggerColumnToClient(bp.EndColumn.Value) : null,
 				Message = bp.Message,
 				Source = new Source
@@ -388,37 +508,86 @@ public class DebugAdapter : DebugAdapterBase
 				}
 			}).ToList();
 
-			return new SetBreakpointsResponse
+			responder.SetResponse(new SetBreakpointsResponse
 			{
 				Breakpoints = responseBreakpoints
-			};
-		});
+			});
+		}
+		catch (Exception ex)
+		{
+			_logger?.Invoke($"HandleSetBreakpointsRequestAsync failed: {ex.Message} , {ex}");
+			responder.SetError(new ProtocolException($"Failed to set breakpoints: {ex.Message}", ex));
+		}
 	}
 
-	protected override SetFunctionBreakpointsResponse HandleSetFunctionBreakpointsRequest(SetFunctionBreakpointsArguments arguments)
+	protected override async void HandleSetFunctionBreakpointsRequestAsync(IRequestResponder<SetFunctionBreakpointsArguments, SetFunctionBreakpointsResponse> responder)
 	{
-		// Function breakpoints not yet fully implemented
-		return new SetFunctionBreakpointsResponse
+		try
 		{
-			Breakpoints = []
+			var arguments = responder.Arguments;
+			var requests = arguments.Breakpoints?.Select(bp =>
+				new SharpDbgFunctionBreakpointRequest(bp.Name, bp.Condition, bp.HitCondition)).ToArray() ?? [];
+			var breakpoints = await ExecuteWithDebuggerProcessingLockAsync(() => _debugger.SetFunctionBreakpoints(requests));
+			responder.SetResponse(new SetFunctionBreakpointsResponse
+			{
+				Breakpoints = breakpoints.Select(bp => new MSBreakpoint
+				{
+					Id = bp.Id,
+					Verified = bp.Verified,
+					Message = bp.Message,
+					Line = null,
+					Column = null,
+					EndLine = null,
+					EndColumn = null,
+					Source = null
+				}).ToList()
+			});
+		}
+		catch (Exception ex)
+		{
+			_logger?.Invoke($"HandleSetFunctionBreakpointsRequestAsync failed: {ex.Message} , {ex}");
+			responder.SetError(new ProtocolException($"Failed to set function breakpoints: {ex.Message}", ex));
+		}
+	}
+
+	protected override async void HandleSetExceptionBreakpointsRequestAsync(IRequestResponder<SetExceptionBreakpointsArguments, SetExceptionBreakpointsResponse> responder)
+	{
+		try
+		{
+			var arguments = responder.Arguments;
+			var breakpointRequests = new List<SharpDbgExceptionBreakpointRequest>();
+			foreach (var filter in arguments.Filters ?? [])
+			{
+				breakpointRequests.Add(new SharpDbgExceptionBreakpointRequest(ParseExceptionFilter(filter)));
+			}
+			foreach (var option in arguments.FilterOptions ?? [])
+			{
+				breakpointRequests.Add(new SharpDbgExceptionBreakpointRequest(ParseExceptionFilter(option.FilterId), option.Condition));
+			}
+			_logger?.Invoke($"Exception breakpoints: {string.Join(", ", breakpointRequests)}");
+			await ExecuteWithDebuggerProcessingLockAsync(() => _debugger.SetExceptionBreakpoints(breakpointRequests));
+
+			responder.SetResponse(new SetExceptionBreakpointsResponse());
+		}
+		catch (Exception ex)
+		{
+			_logger?.Invoke($"HandleSetExceptionBreakpointsRequestAsync failed: {ex.Message} , {ex}");
+			responder.SetError(new ProtocolException($"Failed to set exception breakpoints: {ex.Message}", ex));
+		}
+
+		static SharpDbgExceptionBreakpointFilter ParseExceptionFilter(string filter) => filter switch
+		{
+			"all" => SharpDbgExceptionBreakpointFilter.All,
+			"user-unhandled" => SharpDbgExceptionBreakpointFilter.UserUnhandled,
+			_ => throw new ProtocolException($"Unknown exception breakpoint filter: '{filter}'")
 		};
 	}
 
-	protected override SetExceptionBreakpointsResponse HandleSetExceptionBreakpointsRequest(SetExceptionBreakpointsArguments arguments)
+	protected override async void HandleThreadsRequestAsync(IRequestResponder<ThreadsArguments, ThreadsResponse> responder)
 	{
-		return ExecuteWithExceptionHandling(() =>
+		try
 		{
-			_logger?.Invoke($"Exception breakpoints: {string.Join(", ", arguments?.Filters ?? [])}");
-
-			return new SetExceptionBreakpointsResponse();
-		});
-	}
-
-	protected override ThreadsResponse HandleThreadsRequest(ThreadsArguments arguments)
-	{
-		return ExecuteWithExceptionHandling(() =>
-		{
-			var threads = _debugger.GetThreads();
+			var threads = await ExecuteWithDebuggerProcessingLockAsync(() => _debugger.GetThreads());
 
 			var responseThreads = threads.Select(t => new MSThread
 			{
@@ -426,43 +595,76 @@ public class DebugAdapter : DebugAdapterBase
 				Name = t.name
 			}).ToList();
 
-			return new ThreadsResponse
+			responder.SetResponse(new ThreadsResponse
 			{
 				Threads = responseThreads
-			};
-		});
+			});
+		}
+		catch (Exception ex)
+		{
+			_logger?.Invoke($"HandleThreadsRequestAsync failed: {ex.Message} , {ex}");
+			responder.SetError(new ProtocolException($"Failed to get threads: {ex.Message}", ex));
+		}
 	}
 
-	protected override StackTraceResponse HandleStackTraceRequest(StackTraceArguments arguments)
+	protected override async void HandleStackTraceRequestAsync(IRequestResponder<StackTraceArguments, StackTraceResponse> responder)
 	{
-		return ExecuteWithExceptionHandling(() =>
+		try
 		{
-			var frames = _debugger.GetStackTrace(arguments.ThreadId, arguments.StartFrame ?? 0, arguments.Levels);
+			var arguments = responder.Arguments;
+			var frames = await ExecuteWithDebuggerProcessingLockAsync(() => _debugger.GetStackTrace(arguments.ThreadId, arguments.StartFrame ?? 0, arguments.Levels));
 
-			var responseFrames = frames.Select(f => new MSStackFrame
-			{
-				Id = f.Id,
-				Name = f.Name,
-				Line = ConvertDebuggerLineToClient(f.Line),
-				EndLine = ConvertDebuggerLineToClient(f.EndLine),
-				Column = ConvertDebuggerColumnToClient(f.Column),
-				EndColumn = ConvertDebuggerColumnToClient(f.EndColumn),
-				Source = f.Source is not null ? new Source { Path = f.Source, Name = Path.GetFileName(f.Source), SourceReference = 0 } : null
-			}).ToList();
+			var responseFrames = frames.Select(ToProtocolStackFrame).ToList();
 
-			return new StackTraceResponse
+			responder.SetResponse(new StackTraceResponse
 			{
-				StackFrames = responseFrames,
-				TotalFrames = responseFrames.Count
-			};
-		});
+				StackFrames = responseFrames
+			});
+		}
+		catch (Exception ex)
+		{
+			_logger?.Invoke($"HandleStackTraceRequestAsync failed: {ex.Message} , {ex}");
+			responder.SetError(new ProtocolException($"Failed to get stack trace: {ex.Message}", ex));
+		}
 	}
 
-	protected override ScopesResponse HandleScopesRequest(ScopesArguments arguments)
+	private async void HandleResolveStackFrameRequestAsync(IRequestResponder<ResolveStackFrameArguments, ResolveStackFrameResponse> responder)
 	{
-		return ExecuteWithExceptionHandling(() =>
+		try
 		{
-			var scopes = _debugger.GetScopes(arguments.FrameId);
+			var frame = await ExecuteWithDebuggerProcessingLockAsync(() => _debugger.ResolveStackFrame(responder.Arguments.StackFrameId));
+			responder.SetResponse(new ResolveStackFrameResponse { StackFrame = ToProtocolStackFrame(frame) });
+		}
+		catch (Exception ex)
+		{
+			_logger?.Invoke($"HandleResolveStackFrameRequestAsync failed: {ex.Message} , {ex}");
+			responder.SetError(new ProtocolException($"Failed to resolve stack frame: {ex.Message}", ex));
+		}
+	}
+
+	private MSStackFrame ToProtocolStackFrame(StackFrameInfo frame)
+	{
+		var protocolFrame = new MSStackFrame
+		{
+			Id = frame.Id,
+			Name = frame.Name,
+			Line = ConvertDebuggerLineToClient(frame.Line),
+			EndLine = frame.EndLine is int endLine ? ConvertDebuggerLineToClient(endLine) : null,
+			Column = ConvertDebuggerColumnToClient(frame.Column),
+			EndColumn = frame.EndColumn is int endColumn ? ConvertDebuggerColumnToClient(endColumn) : null,
+			Source = frame.Source is not null ? new Source { Path = frame.Source, Name = Path.GetFileName(frame.Source), SourceReference = 0 } : null,
+			PresentationHint = frame.IsUserCode ? null : MSStackFrame.PresentationHintValue.Subtle
+		};
+		protocolFrame.IsResolved = frame.IsResolved;
+		protocolFrame.DecompiledSourceInfo = frame.DecompiledSourceInfo;
+		return protocolFrame;
+	}
+
+	protected override async void HandleScopesRequestAsync(IRequestResponder<ScopesArguments, ScopesResponse> responder)
+	{
+		try
+		{
+			var scopes = await ExecuteWithDebuggerProcessingLockAsync(() => _debugger.GetScopes(responder.Arguments.FrameId));
 
 			var responseScopes = scopes.Select(s => new Scope
 			{
@@ -471,18 +673,23 @@ public class DebugAdapter : DebugAdapterBase
 				Expensive = s.Expensive
 			}).ToList();
 
-			return new ScopesResponse
+			responder.SetResponse(new ScopesResponse
 			{
 				Scopes = responseScopes
-			};
-		});
+			});
+		}
+		catch (Exception ex)
+		{
+			_logger?.Invoke($"HandleScopesRequestAsync failed: {ex.Message} , {ex}");
+			responder.SetError(new ProtocolException($"Failed to get scopes: {ex.Message}", ex));
+		}
 	}
 
 	protected override async void HandleVariablesRequestAsync(IRequestResponder<VariablesArguments, VariablesResponse> responder)
 	{
 		try
 		{
-			var variables = await _debugger.GetVariables(responder.Arguments.VariablesReference);
+			var variables = await ExecuteWithDebuggerProcessingLockAsync(() => _debugger.GetVariables(responder.Arguments.VariablesReference));
 
 			var responseVariables = variables.Select(v => new Variable
 			{
@@ -512,87 +719,124 @@ public class DebugAdapter : DebugAdapterBase
 		try
 		{
 			var arguments = responder.Arguments;
-			var (result, type, variablesReference) = await _debugger.Evaluate(arguments.Expression, arguments.FrameId);
+			var variableInfo = await ExecuteWithDebuggerProcessingLockAsync(() => _debugger.Evaluate(arguments.Expression, arguments.FrameId));
 
 			var response = new EvaluateResponse
 			{
-				Result = result,
-				Type = type,
-				VariablesReference = variablesReference
+				Result = variableInfo.Value,
+				Type = variableInfo.Type,
+				VariablesReference = variableInfo.VariablesReference,
+				PresentationHint = variableInfo.PresentationHint?.ToDto()
 			};
 			responder.SetResponse(response);
 		}
 		catch (Exception ex)
 		{
-			_logger?.Invoke($"HandleVariablesRequestAsync failed: {ex.Message} , {ex}");
-			responder.SetError(new ProtocolException($"Failed to get variables: {ex.Message}", ex));
+			_logger?.Invoke($"HandleEvaluateRequestAsync failed: {ex.Message} , {ex}");
+			responder.SetError(new ProtocolException($"Failed to evaluate expression: {ex.Message}", ex));
 		}
 	}
 
-	protected override ContinueResponse HandleContinueRequest(ContinueArguments arguments)
+	protected override async void HandleContinueRequestAsync(IRequestResponder<ContinueArguments, ContinueResponse> responder)
 	{
-		return ExecuteWithExceptionHandling(() =>
+		try
 		{
-			_debugger.HandleContinueRequest();
-			return new ContinueResponse
+			await ExecuteWithDebuggerProcessingLockAsync(() => _debugger.HandleContinueRequest());
+			responder.SetResponse(new ContinueResponse
 			{
 				AllThreadsContinued = true
-			};
-		});
+			});
+		}
+		catch (Exception ex)
+		{
+			_logger?.Invoke($"HandleContinueRequestAsync failed: {ex.Message} , {ex}");
+			responder.SetError(new ProtocolException($"Failed to continue: {ex.Message}", ex));
+		}
 	}
 
-	protected override NextResponse HandleNextRequest(NextArguments arguments)
+	protected override async void HandleNextRequestAsync(IRequestResponder<NextArguments> responder)
 	{
-		return ExecuteWithExceptionHandling(() =>
+		try
 		{
-			_debugger.StepNext(arguments.ThreadId);
-			return new NextResponse();
-		});
+			await ExecuteWithDebuggerProcessingLockAsync(() => _debugger.StepNext(responder.Arguments.ThreadId));
+			responder.SetResponse(new NextResponse());
+		}
+		catch (Exception ex)
+		{
+			_logger?.Invoke($"HandleNextRequestAsync failed: {ex.Message} , {ex}");
+			responder.SetError(new ProtocolException($"Failed to step: {ex.Message}", ex));
+		}
 	}
 
-	protected override StepInResponse HandleStepInRequest(StepInArguments arguments)
+	protected override async void HandleStepInRequestAsync(IRequestResponder<StepInArguments> responder)
 	{
-		return ExecuteWithExceptionHandling(() =>
+		try
 		{
-			_debugger.StepIn(arguments.ThreadId);
-			return new StepInResponse();
-		});
+			await ExecuteWithDebuggerProcessingLockAsync(() => _debugger.StepIn(responder.Arguments.ThreadId));
+			responder.SetResponse(new StepInResponse());
+		}
+		catch (Exception ex)
+		{
+			_logger?.Invoke($"HandleStepInRequestAsync failed: {ex.Message} , {ex}");
+			responder.SetError(new ProtocolException($"Failed to step in: {ex.Message}", ex));
+		}
 	}
 
-	protected override StepOutResponse HandleStepOutRequest(StepOutArguments arguments)
+	protected override async void HandleStepOutRequestAsync(IRequestResponder<StepOutArguments> responder)
 	{
-		return ExecuteWithExceptionHandling(() =>
+		try
 		{
-			_debugger.StepOut(arguments.ThreadId);
-			return new StepOutResponse();
-		});
+			await ExecuteWithDebuggerProcessingLockAsync(() => _debugger.StepOut(responder.Arguments.ThreadId));
+			responder.SetResponse(new StepOutResponse());
+		}
+		catch (Exception ex)
+		{
+			_logger?.Invoke($"HandleStepOutRequestAsync failed: {ex.Message} , {ex}");
+			responder.SetError(new ProtocolException($"Failed to step out: {ex.Message}", ex));
+		}
 	}
 
-	protected override PauseResponse HandlePauseRequest(PauseArguments arguments)
+	protected override async void HandlePauseRequestAsync(IRequestResponder<PauseArguments> responder)
 	{
-		return ExecuteWithExceptionHandling(() =>
+		try
 		{
-			_debugger.Pause();
-			return new PauseResponse();
-		});
+			await ExecuteWithDebuggerProcessingLockAsync(() => _debugger.Pause());
+			responder.SetResponse(new PauseResponse());
+		}
+		catch (Exception ex)
+		{
+			_logger?.Invoke($"HandlePauseRequestAsync failed: {ex.Message} , {ex}");
+			responder.SetError(new ProtocolException($"Failed to pause: {ex.Message}", ex));
+		}
 	}
 
-	protected override DisconnectResponse HandleDisconnectRequest(DisconnectArguments arguments)
+	protected override async void HandleDisconnectRequestAsync(IRequestResponder<DisconnectArguments> responder)
 	{
-		return ExecuteWithExceptionHandling(() =>
+		try
 		{
-			_debugger.Disconnect(arguments?.TerminateDebuggee ?? false);
-			return new DisconnectResponse();
-		});
+			await ExecuteWithDebuggerProcessingLockAsync(() => _debugger.Disconnect(responder.Arguments?.TerminateDebuggee ?? false));
+			responder.SetResponse(new DisconnectResponse());
+			RequestDebuggerProcessShutdown();
+		}
+		catch (Exception ex)
+		{
+			_logger?.Invoke($"HandleDisconnectRequestAsync failed: {ex.Message} , {ex}");
+			responder.SetError(new ProtocolException($"Failed to disconnect: {ex.Message}", ex));
+		}
 	}
 
-	protected override TerminateResponse HandleTerminateRequest(TerminateArguments arguments)
+	protected override async void HandleTerminateRequestAsync(IRequestResponder<TerminateArguments> responder)
 	{
-		return ExecuteWithExceptionHandling(() =>
+		try
 		{
-			_debugger.Terminate();
-			return new TerminateResponse();
-		});
+			await ExecuteWithDebuggerProcessingLockAsync(() => _debugger.Terminate());
+			responder.SetResponse(new TerminateResponse());
+		}
+		catch (Exception ex)
+		{
+			_logger?.Invoke($"HandleTerminateRequestAsync failed: {ex.Message} , {ex}");
+			responder.SetError(new ProtocolException($"Failed to terminate: {ex.Message}", ex));
+		}
 	}
 
 	protected override async void HandleExceptionInfoRequestAsync(IRequestResponder<ExceptionInfoArguments, ExceptionInfoResponse> responder)
@@ -600,7 +844,7 @@ public class DebugAdapter : DebugAdapterBase
 		try
 		{
 			var threadId = responder.Arguments.ThreadId;
-			var exceptionInfo = await _debugger.ExceptionInfo(new ThreadId(threadId));
+			var exceptionInfo = await ExecuteWithDebuggerProcessingLockAsync(() => _debugger.ExceptionInfo(new ThreadId(threadId)));
 
 			var response = new ExceptionInfoResponse
 			{
@@ -642,33 +886,6 @@ public class DebugAdapter : DebugAdapterBase
 			_logger?.Invoke($"HandleExceptionInfoRequestAsync failed: {ex.Message} , {ex}");
 			responder.SetError(new ProtocolException($"Failed to get exception info: {ex.Message}", ex));
 		}
-	}
-
-	protected override GotoResponse HandleGotoRequest(GotoArguments arguments)
-	{
-		return base.HandleGotoRequest(arguments);
-	}
-
-	protected override GotoTargetsResponse HandleGotoTargetsRequest(GotoTargetsArguments arguments)
-	{
-		return base.HandleGotoTargetsRequest(arguments);
-		var response = new GotoTargetsResponse
-		{
-			Targets =
-			[
-				new GotoTarget
-				{
-					Id = 0,
-					Label = null,
-					Line = 0,
-					Column = null,
-					EndLine = null,
-					EndColumn = null,
-					InstructionPointerReference = null
-				}
-			]
-		};
-		return response;
 	}
 
 	// Coordinate conversion helpers

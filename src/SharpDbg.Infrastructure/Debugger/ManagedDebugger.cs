@@ -1,16 +1,11 @@
 using System.Diagnostics;
-using System.Reflection.Metadata;
-using System.Reflection.Metadata.Ecma335;
-using System.Reflection.PortableExecutable;
-using System.Runtime.InteropServices;
+using System.Threading.Channels;
 using Ardalis.GuardClauses;
-using ClrDebug;
-using ICSharpCode.Decompiler.Metadata;
-using SharpDbg.Infrastructure.Debugger.ExpressionEvaluator;
-using SharpDbg.Infrastructure.Debugger.ExpressionEvaluator.Compiler;
-using SharpDbg.Infrastructure.Debugger.ExpressionEvaluator.Interpreter;
+using ICorDebugSharp;
+using NeoSmart.AsyncLock;
+using SharpDbg.Infrastructure.Debugger.ExpressionEvaluator.Cil;
 using SharpDbg.Infrastructure.Debugger.Models;
-using ZLinq;
+using SharpDbg.Infrastructure.Debugger.Models.Response;
 
 namespace SharpDbg.Infrastructure.Debugger;
 
@@ -19,64 +14,82 @@ public enum ManagedExceptionStopMode { All, Unhandled, None }
 // v1 of this class was AI generated, and could definitely do with some cleaning up
 public partial class ManagedDebugger
 {
-	private CorDebug? _corDebug;
-	private CorDebugProcess? _process;
+	private ICorDebug? _corDebug;
+	private ICorDebugProcess? _process;
 	private readonly CorDebugManagedCallback _callbacks;
 	private readonly BreakpointManager _breakpointManager;
 	private readonly VariableManager _variableManager;
 	private readonly FrameReferenceManager _frameReferenceManager;
 	private readonly Action<string>? _logger;
-	private readonly Dictionary<int, CorDebugThread> _threads = new();
+	private sealed class ThreadInfo(ICorDebugThread thread)
+	{
+		public ICorDebugThread Thread { get; } = thread;
+		public string? Name { get; set; }
+	}
+
+	private readonly Dictionary<int, ThreadInfo> _threads = new();
 	private readonly Dictionary<CORDB_ADDRESS, ModuleInfo> _modules = new();
+	private readonly HashSet<COR_TYPEID> _initializedStaticTypes = [];
+	private ICorDebugFunction? _suppressFinalizeFunction;
+	/// <summary>
+	/// Monotonically increasing version of the set of loaded debuggee modules. Incremented whenever a module
+	/// is loaded or unloaded, so anything derived from <see cref="AllModules"/> (the expression compile cache and the
+	/// metadata-blocks cache) can detect staleness and rebuild.
+	/// </summary>
+	internal int ModuleSet_Version { get; private set; }
 	private bool _isAttached;
 	private bool _isRemoteAttach;
 	private int? _pendingAttachProcessId;
-	private int _processId;
-	private Process? _launchedProcess;
-	private int? _launchedProcessExitCode;
-	private int _exitReported;
-	private bool _keepOutputReaders;
-	public ManagedExceptionStopMode ExceptionStopMode { get; set; } = ManagedExceptionStopMode.All;
 	private bool _justMyCode;
+	private bool _stopAtEntry;
+	private EntryBreakpoint? _entryBreakpoint;
+	private sealed record EntryBreakpoint(ICorDebugFunctionBreakpoint CorBreakpoint, CORDB_ADDRESS ModuleBaseAddress, int MethodToken, int IlOffset);
+
+	// The active exception filters and optional type conditions supplied by the DAP client.
+	private IReadOnlyList<SharpDbgExceptionBreakpointRequest> _exceptionBreakpoints = [];
+	// Per-thread state retained between callbacks for the same exception propagation sequence.
+	private readonly Dictionary<ThreadId, ExceptionPropagationState> _exceptionStates = [];
+	// The mode that caused each thread's latest exception stop, used by the exceptionInfo response.
+	private readonly Dictionary<ThreadId, SharpDbgExceptionBreakMode> _exceptionBreakModes = [];
 	private AsyncStepper? _asyncStepper;
-	private CompiledExpressionInterpreter _expressionInterpreter = null!;
+	private CilExpressionEvaluator _expressionEvaluator = null!;
+
+	private Process? _debuggeeProcess;
+	public ManagedExceptionStopMode? ExceptionStopMode { get; set; }
+	public bool IsProcessAttached => _process is not null;
+	public int ProcessId => _process?.Id ?? _debuggeeProcess?.Id ?? 0;
+	public bool IsProcessRunning
+	{
+		get
+		{
+			try { return _process?.IsRunning ?? false; }
+			catch { return false; }
+		}
+	}
 
 	public event Action<int, string>? OnStopped;
-	// ThreadId, FilePath, Line, Column, Reason, BreakpointId
-	public event Action<int, string, int, int, string, DecompiledSourceInfo?, int>? OnStopped2;
+	// ThreadId, FilePath, Line, Column, Reason, HitBreakpointIds, DecompiledSourceInfo
+	public event Action<int, string, int, int, string, List<int>?>? OnStopped2;
 	public event Action<int>? OnContinued;
 	public event Action<int?>? OnExited;
 	public event Action? OnUnhandledException;
-	public event Action<int, string>? OnThreadStarted;
-	public event Action<int, string>? OnThreadExited;
+	public event Action? OnTerminated;
+	public event Action<int>? OnThreadStarted;
+	public event Action<int>? OnThreadExited;
 	public event Action<string, string, string>? OnModuleLoaded;
-	public event Action<string>? OnOutput;
-	public event Action<string, string>? OnTargetOutput;
+	public event Action<string, string, string>? OnModuleUnloaded;
+	// Output text, isError (true for stderr, false for stdout)
+	public event Action<string, bool>? OnOutput;
+	public event Action<string>? OnDebugOutput;
+	public event Action<int, string>? OnProcessStarted;
 	public event Action<BreakpointManager.BreakpointInfo>? OnBreakpointChanged;
 	public event Func<LaunchInfo, int> SendRunInTerminalRequest = null!;
 
 	public EvalStatus EvalStatus { get; }
 
-	public bool IsProcessAttached => _process is not null;
-
-	public int ProcessId => _processId;
-
-	public bool IsProcessRunning
-	{
-		get
-		{
-			if (_process is null)
-				return false;
-			try
-			{
-				return _process.IsRunning;
-			}
-			catch
-			{
-				return false;
-			}
-		}
-	}
+	private Task? _runtimeEventCallbackProcessing;
+	private readonly Channel<CorDebugManagedCallbackEventArgs> _runtimeEventChannel;
+	public readonly AsyncLock DapRequestAndRuntimeEventLock = new();
 
 	public ManagedDebugger(Action<string>? logger = null)
 	{
@@ -86,13 +99,73 @@ public partial class ManagedDebugger
 		_frameReferenceManager = new FrameReferenceManager();
 		_callbacks = new CorDebugManagedCallback();
 		EvalStatus = new EvalStatus();
-		_asyncStepper = new AsyncStepper(_modules, _callbacks, this);
-
-		// Subscribe to callback events
-		_callbacks.OnAnyEvent += OnAnyEvent;
+		_asyncStepper = new AsyncStepper(_modules, this);
+		_runtimeEventChannel = Channel.CreateUnbounded<CorDebugManagedCallbackEventArgs>(new UnboundedChannelOptions
+		{
+			SingleReader = false,
+			SingleWriter = true
+		});
+		_callbacks.OnAnyEvent += QueueEvent;
+		_runtimeEventCallbackProcessing = Task.Run(ProcessRuntimeEventQueue);
 	}
 
-	private async void OnAnyEvent(object? sender, CorDebugManagedCallbackEventArgs e)
+	private void QueueEvent(object? sender, CorDebugManagedCallbackEventArgs e)
+	{
+		_runtimeEventChannel.Writer.TryWrite(e);
+	}
+
+	public async Task DrainRuntimeEventQueue()
+	{
+		// Caller should have obtained this lock, and we are re-entrant here
+		using (await DapRequestAndRuntimeEventLock.LockAsync())
+		{
+			var reader = _runtimeEventChannel.Reader;
+			// Process all immediately available events
+			while (reader.TryRead(out var callbackEvent))
+			{
+				await OnAnyEvent(this, callbackEvent).ConfigureAwait(false);
+			}
+		}
+	}
+
+	private async Task ProcessRuntimeEventQueue()
+	{
+		try
+		{
+			var reader = _runtimeEventChannel.Reader;
+			while (await reader.WaitToReadAsync())
+			{
+				// If a Dap request has obtained the lock, we will pause here. It will drain runtime events, and our TryRead may return false, which is fine
+				using (await DapRequestAndRuntimeEventLock.LockAsync())
+				{
+					if (reader.TryRead(out var callbackEvent) is false) continue;
+					await OnAnyEvent(this, callbackEvent).ConfigureAwait(false);
+				}
+			}
+		}
+		catch (Exception e)
+		{
+			_logger?.Invoke($"Critical failure processing runtime event queue, no further events will be processed: {e}");
+			throw;
+		}
+	}
+
+	internal async Task<CorDebugManagedCallbackEventArgs> ProcessRuntimeEventsUntilEvalEvent()
+	{
+		var reader = _runtimeEventChannel.Reader;
+		while (await reader.WaitToReadAsync())
+		{
+			if (reader.TryRead(out var callbackEvent) is false) throw new InvalidOperationException("Expected to read an event from the runtime event queue, but none was available");
+			await OnAnyEvent(this, callbackEvent).ConfigureAwait(false);
+			if (callbackEvent is EvalCompleteCorDebugManagedCallbackEventArgs or EvalExceptionCorDebugManagedCallbackEventArgs)
+			{
+				return callbackEvent;
+			}
+		}
+		throw new InvalidOperationException("Expected to read an eval event from the runtime event queue, but Channel completed unexpectedly");
+	}
+
+	private async Task OnAnyEvent(object? sender, CorDebugManagedCallbackEventArgs e)
 	{
 		try
 		{
@@ -105,64 +178,62 @@ public partial class ManagedDebugger
 				case CreateThreadCorDebugManagedCallbackEventArgs a: HandleThreadCreated(sender, a); break;
 				case ExitThreadCorDebugManagedCallbackEventArgs a: HandleThreadExited(sender, a); break;
 				case LoadModuleCorDebugManagedCallbackEventArgs a: HandleModuleLoaded(sender, a); break;
+				case UnloadModuleCorDebugManagedCallbackEventArgs a: HandleModuleUnloaded(sender, a); break;
 				case BreakpointCorDebugManagedCallbackEventArgs a: await HandleBreakpoint(sender, a).ConfigureAwait(false); break;
 				case StepCompleteCorDebugManagedCallbackEventArgs a: HandleStepComplete(sender, a); break;
 				case BreakCorDebugManagedCallbackEventArgs a: HandleBreak(sender, a); break;
 				case ExceptionCorDebugManagedCallbackEventArgs a: HandleException(sender, a); break;
+				case Exception2CorDebugManagedCallbackEventArgs a: HandleException2(sender, a); break;
 				case EvalCompleteCorDebugManagedCallbackEventArgs or EvalExceptionCorDebugManagedCallbackEventArgs: break; // don't continue on these, as they are being used for expression evaluation
-				default: e.Controller.Continue(false); break;
+				default: _process?.Continue(false); break;
 			}
 		}
 		catch (Exception ex)
 		{
 			_logger?.Invoke($"Error handling event {e.GetType().Name}: {ex}");
+			if (_process is not null && _process.TryIsRunning(out var isRunning) is Cor.S_OK && isRunning is false)
+			{
+				Continue();
+			}
 		}
 	}
 
 	private void HandleLogMessage(object? sender, LogMessageCorDebugManagedCallbackEventArgs logMessageEvent)
 	{
 		_logger?.Invoke($"Log: {logMessageEvent.Message}");
-		OnTargetOutput?.Invoke("debug", logMessageEvent.Message.TrimEnd('\r', '\n'));
+		OnDebugOutput?.Invoke(logMessageEvent.Message.TrimEnd('\r', '\n'));
 		Continue();
-	}
-
-	private void ReportProcessExit(int? exitCode)
-	{
-		if (Interlocked.Exchange(ref _exitReported, 1) == 0)
-			OnExited?.Invoke(exitCode);
 	}
 
 	/// <summary>
 	/// Actually attach to an existing process
 	/// </summary>
-	private async Task PerformAttach(int processId)
+	private void PerformAttach(int processId)
 	{
 		_logger?.Invoke($"Attaching to process: {processId}");
 
 		// Initialize the debugger
-		var dbgshim = new DbgShim(NativeLibrary.Load("dbgshim", typeof(ManagedDebugger).Assembly, null));
-		await Task.Run(() =>
+		_ = Task.Run(async () =>
 		{
-			_corDebug = ClrDebugExtensions.Automatic(dbgshim, processId);
+			_corDebug = await ClrDebugExtensions.Automatic(processId);
 			_corDebug.Initialize();
 			_corDebug.SetManagedHandler(_callbacks);
 
 			// Attach to the process
 			_process = _corDebug.DebugActiveProcess(processId, false);
-			_processId = processId;
 			_isAttached = true;
+			ConfigureExceptionCallbacks();
 
 			_logger?.Invoke($"Attached to process: {processId}");
 			SendAllBreakpointEvents();
-		}).ConfigureAwait(false);
+		});
 	}
 
-	private async Task PerformRemoteAttach(RemoteAttachInfo remoteAttachInfo)
+	private void PerformRemoteAttach(RemoteAttachInfo remoteAttachInfo)
 	{
 		_logger?.Invoke($"Attaching to remote process on {remoteAttachInfo.Address}:{remoteAttachInfo.Port}");
 
-		var dbgshim = new DbgShim(NativeLibrary.Load("dbgshim", typeof(ManagedDebugger).Assembly, null));
-		_corDebug = ClrDebugExtensions.Mobile(dbgshim, remoteAttachInfo);
+		_corDebug = ClrDebugExtensions.Mobile(remoteAttachInfo);
 		_corDebug.SetManagedHandler(_callbacks);
 		try
 		{
@@ -172,7 +243,7 @@ public partial class ManagedDebugger
 		} catch { /* */ }
 
 		_logger?.Invoke($"Debugger listening on port {remoteAttachInfo.Port}, awaiting connection from debuggee");
-		await Task.Run(SendAllBreakpointEvents).ConfigureAwait(false);
+		_ = Task.Run(SendAllBreakpointEvents);
 	}
 
 	private void SendAllBreakpointEvents()
@@ -190,21 +261,28 @@ public partial class ManagedDebugger
 		_process.Continue(false);
 	}
 
-	private CorDebugStepper? _stepper;
+	private void ConfigureExceptionCallbacks()
+	{
+		if (_process is not ICorDebugProcess8 process8) return;
+		var result = process8.TryEnableExceptionCallbacksOutsideOfMyCode(!_justMyCode);
+		if (result is not Cor.S_OK) _logger?.Invoke($"Unable to configure exception callbacks outside user code: {result}");
+	}
+
+	private ICorDebugStepper? _stepper;
 
 	/// <summary>
 	/// Setup a stepper without continuing execution
 	/// </summary>
-	internal CorDebugStepper SetupStepper(CorDebugThread thread, AsyncStepper.StepType stepType)
+	internal ICorDebugStepper SetupStepper(ICorDebugThread thread, AsyncStepper.StepType stepType)
 	{
 		var frame = thread.ActiveFrame;
-		if (frame is not CorDebugILFrame ilFrame) throw new InvalidOperationException("Active frame is not an IL frame");
+		if (frame is not ICorDebugILFrame ilFrame) throw new InvalidOperationException("Active frame is not an IL frame");
 		if (_stepper is not null) throw new InvalidOperationException("A step operation is already in progress");
 
-		CorDebugStepper stepper = frame.CreateStepper();
+		ICorDebugStepper stepper = frame.CreateStepper();
 		stepper.SetInterceptMask(CorDebugIntercept.INTERCEPT_ALL & ~(CorDebugIntercept.INTERCEPT_SECURITY | CorDebugIntercept.INTERCEPT_CLASS_INIT));
 		stepper.SetUnmappedStopMask(CorDebugUnmappedStop.STOP_NONE);
-		//stepper.SetJMC(true);
+		if (_justMyCode) stepper.SetJMC(true);
 
 		if (stepType == AsyncStepper.StepType.StepOut)
 		{
@@ -212,10 +290,10 @@ public partial class ManagedDebugger
 		}
 		else // StepIn or StepOver
 		{
-			var symbolReader = _modules[frame.Function.Module.BaseAddress].SymbolReader;
+			var metadataReader = _modules[frame.Function.Module.BaseAddress].MetadataReader;
 
 			var currentIlOffset = ilFrame.IP.pnOffset;
-			var nullableResult = symbolReader?.GetStartAndEndSequencePointIlOffsetsForIlOffset(frame.Function.Token, currentIlOffset);
+			var nullableResult = metadataReader.GetStartAndEndSequencePointIlOffsetsForIlOffset(frame.Function.Token, currentIlOffset);
 			if (nullableResult is var (startIlOffset, endIlOffset))
 			{
 				if (startIlOffset == endIlOffset)
@@ -224,8 +302,8 @@ public partial class ManagedDebugger
 				}
 				var stepRange = new COR_DEBUG_STEP_RANGE
 				{
-					startOffset = startIlOffset,
-					endOffset = endIlOffset
+					startOffset = checked((uint)startIlOffset),
+					endOffset = checked((uint)endIlOffset)
 				};
 				var stepIn = stepType is AsyncStepper.StepType.StepIn;
 				stepper.StepRange(stepIn, [stepRange], 1);
@@ -246,23 +324,21 @@ public partial class ManagedDebugger
 	/// </summary>
 	private bool TryBindBreakpoint(BreakpointManager.BreakpointInfo bp)
 	{
-		if (bp.IsIlBreakpoint)
-			return TryBindIlBreakpoint(bp);
-
+		if (bp.IsIlBreakpoint) return TryBindIlBreakpoint(bp);
 		try
 		{
 			if (_process is null) return false;
 
 			// Find a module that contains the source file
 			ModuleInfo? targetModule = null;
-			SymbolReader.ResolvedBreakpoint? resolved = null;
+			ModuleMetadataReader.ResolvedBreakpoint? resolved = null;
 
 			foreach (var moduleInfo in _modules.Values)
 			{
-				if (moduleInfo.SymbolReader is null)
+				if (moduleInfo.MetadataReader.HasSymbols is false)
 					continue;
 
-				resolved = moduleInfo.SymbolReader.ResolveBreakpoint(bp.FilePath, bp.Line, bp.Column);
+				resolved = moduleInfo.MetadataReader.ResolveBreakpoint(bp.FilePath, bp.Line, bp.Column);
 				if (resolved is not null)
 				{
 					targetModule = moduleInfo;
@@ -284,8 +360,9 @@ public partial class ManagedDebugger
 			var ilCode = function.ILCode;
 
 			// Create a breakpoint at the resolved IL offset
-			var corBreakpoint = ilCode.CreateBreakpoint(resolved.ILOffset);
-			corBreakpoint.Activate(true);
+			var corBreakpoint = TryGetEntryBreakpoint(targetModule.BaseAddress, resolved.MethodToken, resolved.ILOffset)
+				?? ilCode.CreateBreakpoint(resolved.ILOffset);
+			if (corBreakpoint != _entryBreakpoint?.CorBreakpoint) corBreakpoint.Activate(true);
 
 			// Update breakpoint info
 			bp.CorBreakpoint = corBreakpoint;
@@ -311,142 +388,11 @@ public partial class ManagedDebugger
 	}
 
 	/// <summary>
-	/// Try to bind an IL-level method breakpoint
-	/// </summary>
-	private bool TryBindIlBreakpoint(BreakpointManager.BreakpointInfo bp)
-	{
-		try
-		{
-			if (_process is null) return false;
-
-			var (targetModule, methodToken) = TryResolveMethodToken(bp.MethodName, bp.ModuleName);
-			if (targetModule is null)
-			{
-				bp.Verified = false;
-				bp.Message = "The breakpoint will not currently be hit. The method could not be found.";
-				_logger?.Invoke($"IL breakpoint {bp.MethodName}:IL_{bp.IlOffset:X4} - method not found");
-				return false;
-			}
-
-			// Get the function from the method token
-			var function = targetModule.Module.GetFunctionFromToken(methodToken);
-			var ilCode = function.ILCode;
-
-			// Create a breakpoint at the IL offset
-			var corBreakpoint = ilCode.CreateBreakpoint(bp.IlOffset);
-			corBreakpoint.Activate(true);
-
-			// Update breakpoint info
-			bp.CorBreakpoint = corBreakpoint;
-			bp.Verified = true;
-			bp.ModuleBaseAddress = targetModule.BaseAddress;
-			bp.ResolvedBreakpointFromPdb = new SymbolReader.ResolvedBreakpoint(
-				methodToken,
-				bp.IlOffset,
-				bp.IlOffset,
-				bp.IlOffset,
-				0,
-				0,
-				bp.FilePath);
-			bp.Message = null;
-
-			_logger?.Invoke($"IL breakpoint bound at {bp.FilePath}:IL_{bp.IlOffset:X4} -> method 0x{methodToken:X}");
-			return true;
-		}
-		catch (Exception ex)
-		{
-			_logger?.Invoke($"Error binding IL breakpoint {bp.FilePath}:IL_{bp.IlOffset:X4}: {ex.Message}");
-			bp.Verified = false;
-			bp.Message = $"Error binding IL breakpoint: {ex.Message}";
-			return false;
-		}
-	}
-
-	/// <summary>
-	/// Try to resolve a method token by name across loaded modules.
-	/// </summary>
-	private (ModuleInfo? Module, int MethodToken) TryResolveMethodToken(string methodName, string? moduleName)
-	{
-		var lastDot = methodName.LastIndexOf('.');
-		if (lastDot <= 0)
-			return (null, 0);
-
-		var requestedType = methodName.Substring(0, lastDot);
-		var requestedMethod = methodName.Substring(lastDot + 1);
-
-		foreach (var moduleInfo in _modules.Values)
-		{
-			if (!string.IsNullOrWhiteSpace(moduleName))
-			{
-				var candidateName = moduleInfo.ModuleName;
-				if (!string.Equals(candidateName, moduleName, StringComparison.OrdinalIgnoreCase)
-				    && !string.Equals(Path.GetFileNameWithoutExtension(candidateName), moduleName, StringComparison.OrdinalIgnoreCase))
-				{
-					continue;
-				}
-			}
-
-			var (token, resolved) = TryResolveMethodTokenInModule(moduleInfo, requestedType, requestedMethod);
-			if (resolved)
-				return (moduleInfo, token);
-		}
-
-		return (null, 0);
-	}
-
-	/// <summary>
-	/// Try to resolve a method token in a specific module by type and method name.
-	/// </summary>
-	private (int Token, bool Resolved) TryResolveMethodTokenInModule(ModuleInfo moduleInfo, string requestedType, string requestedMethod)
-	{
-		var assemblyPath = moduleInfo.ModulePath;
-		if (string.IsNullOrEmpty(assemblyPath) || !File.Exists(assemblyPath))
-			return (0, false);
-
-		try
-		{
-			using var file = new ICSharpCode.Decompiler.Metadata.PEFile(assemblyPath, PEStreamOptions.PrefetchMetadata);
-			var reader = file.Metadata;
-			var comparer = StringComparison.OrdinalIgnoreCase;
-
-			foreach (var typeHandle in reader.TypeDefinitions)
-			{
-				var typeDef = reader.GetTypeDefinition(typeHandle);
-				var typeName = reader.GetString(typeDef.Name);
-				var ns = reader.GetString(typeDef.Namespace);
-				var fullTypeName = string.IsNullOrEmpty(ns) ? typeName : $"{ns}.{typeName}";
-
-				if (!string.Equals(fullTypeName, requestedType, comparer)
-				    && !string.Equals(typeName, requestedType, comparer))
-				{
-					continue;
-				}
-
-				foreach (var methodHandle in typeDef.GetMethods())
-				{
-					var methodDef = reader.GetMethodDefinition(methodHandle);
-					var name = reader.GetString(methodDef.Name);
-					if (string.Equals(name, requestedMethod, comparer))
-					{
-						return (MetadataTokens.GetToken(methodHandle), true);
-					}
-				}
-			}
-		}
-		catch (Exception ex)
-		{
-			_logger?.Invoke($"Error resolving method token in {assemblyPath}: {ex.Message}");
-		}
-
-		return (0, false);
-	}
-
-	/// <summary>
 	/// Try to bind all pending breakpoints (called when a new module is loaded)
 	/// </summary>
 	private void TryBindPendingBreakpoints()
 	{
-		var pendingBreakpoints = _breakpointManager.GetPendingBreakpoints();
+		var pendingBreakpoints = _breakpointManager.GetPendingBreakpoints().Where(bp => !bp.IsFunctionBreakpoint);
 
 		foreach (var bp in pendingBreakpoints)
 		{
@@ -458,88 +404,95 @@ public partial class ManagedDebugger
 		}
 	}
 
-	internal CorDebugILFrame GetFrameForThreadIdAndStackDepth(ThreadId threadId, FrameStackDepth stackDepth)
+	/// <summary>
+	/// Binds all matching functions in a module and returns true only when the BreakpointInfo becomes verified.
+	/// </summary>
+	private bool TryBindFunctionBreakpoint(BreakpointManager.BreakpointInfo bp, ModuleInfo module)
 	{
-		// We need to re-obtain the IlFrame in case it has been neutered
-		var thread = _process!.Threads.Single(s => s.Id == threadId.Value);
-		var frame = thread.ActiveChain.Frames[stackDepth.Value];
-		if (frame is not CorDebugILFrame ilFrame) throw new InvalidOperationException("Frame is not an IL frame");
+		if (module.MetadataReader.HasSymbols is false || bp.FunctionName is null) return false;
+		var wasVerified = bp.Verified;
+		try
+		{
+			var pattern = FunctionBreakpointPattern.Parse(bp.FunctionName);
+			foreach (var resolved in FunctionBreakpointMetadataResolver.Resolve(module.MetadataReader, pattern))
+			{
+				if (bp.FunctionBindings.Any(binding => binding.ModuleBaseAddress == module.BaseAddress && binding.MethodToken == resolved.MethodToken))
+				{
+					continue;
+				}
+				var function = module.Module.GetFunctionFromToken(resolved.MethodToken);
+				var corBreakpoint = TryGetEntryBreakpoint(module.BaseAddress, resolved.MethodToken, resolved.Source.ILOffset)
+					?? function.ILCode.CreateBreakpoint(resolved.Source.ILOffset);
+				if (corBreakpoint != _entryBreakpoint?.CorBreakpoint) corBreakpoint.Activate(true);
+				bp.FunctionBindings.Add(new BreakpointManager.FunctionBreakpointBinding(corBreakpoint, module.BaseAddress, resolved.MethodToken, resolved.Source));
+				bp.Verified = true;
+				bp.Message = null;
+			}
+		}
+		catch (Exception ex)
+		{
+			_logger?.Invoke($"Error binding function breakpoint '{bp.FunctionName}' in {module.ModuleName}: {ex.Message}");
+			if (!bp.Verified) bp.Message = $"Error binding function breakpoint: {ex.Message}";
+		}
+		return wasVerified is false && bp.Verified;
+	}
+
+	private void EnsureNoProcessBeingDebugged()
+	{
+		if (_process is not null) throw new InvalidOperationException("A process is already being debugged, you must terminate/detach first.");
+	}
+
+	private ICorDebugFunctionBreakpoint? TryGetEntryBreakpoint(CORDB_ADDRESS moduleBaseAddress, int methodToken, int ilOffset)
+	{
+		return _entryBreakpoint is { } entry && entry.ModuleBaseAddress == moduleBaseAddress &&
+			entry.MethodToken == methodToken && entry.IlOffset == ilOffset
+			? entry.CorBreakpoint
+			: null;
+	}
+
+	internal ICorDebugILFrame GetIlFrameForThreadIdAndStackDepth(ThreadId threadId, FrameStackDepth stackDepth)
+	{
+		var frame = GetFrameForThreadIdAndStackDepth(threadId, stackDepth);
+		if (frame is not ICorDebugILFrame ilFrame) throw new InvalidOperationException("Frame is not an IL frame");
 		return ilFrame;
 	}
 
-	private static string GetFunctionFormattedName(CorDebugFunction function)
+	internal ICorDebugFrame GetFrameForThreadIdAndStackDepth(ThreadId threadId, FrameStackDepth stackDepth)
 	{
-		try
-		{
-			var token = function.Token;
-			var module = function.Module;
-			var metadataImport = module.GetMetaDataInterface().MetaDataImport;
-			var methodName = metadataImport.GetMethodProps(token).szMethod;
-
-			var @class = function.Class;
-			var classToken = @class.Token;
-			var className = metadataImport.GetTypeDefProps(classToken).szTypeDef;
-
-			return $"{Path.GetFileName(module.Name)}!{className}.{methodName}()";
-		}
-		catch
-		{
-			return "Unknown";
-		}
+		// We need to re-obtain the frame in case it has been neutered
+		var thread = _process!.GetThread(threadId.Value);
+		var frame = EnumerateFramesForThread(thread).ElementAt(stackDepth.Value);
+		return frame;
 	}
 
-	/// <summary>
-	/// Get a summary of all loaded modules.
-	/// </summary>
-	public List<(string Name, string Path, string BaseAddress, bool IsUserCode, bool HasSymbols)> GetModules()
+	private static IEnumerable<ICorDebugFrame> EnumerateFramesForThread(ICorDebugThread thread)
 	{
-		return _modules.Values
-			.Select(m => (m.ModuleName, m.ModulePath, m.BaseAddress.ToString(), m.IsUserCode, m.SymbolReader is not null))
-			.ToList();
-	}
-
-	/// <summary>
-	/// Get all source files referenced in the PDBs of user modules.
-	/// </summary>
-	public List<string> GetSourceFiles()
-	{
-		var files = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-		foreach (var module in _modules.Values.Where(m => m.IsUserCode))
+		foreach (var chain in thread.EnumerateChains())
 		{
-			if (module.SymbolReader is null)
-				continue;
-
-			foreach (var file in module.SymbolReader.GetSourceFiles())
+			if (chain.IsManaged is false) continue;
+			foreach (var frame in chain.EnumerateFrames())
 			{
-				if (IsGeneratedSourcePath(file))
-					continue;
-
-				files.Add(file);
+				yield return frame;
 			}
 		}
-
-		return files.OrderBy(f => f, StringComparer.OrdinalIgnoreCase).ToList();
 	}
 
-	private static bool IsGeneratedSourcePath(string path)
-	{
-		// Skip build-generated files under obj/bin and compiler-generated suffixes.
-		var segments = path.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-		if (segments.Any(s =>
-			s.Equals("obj", StringComparison.OrdinalIgnoreCase) ||
-			s.Equals("bin", StringComparison.OrdinalIgnoreCase)))
-		{
-			return true;
-		}
+	internal IReadOnlyCollection<ModuleInfo> AllModules => _modules.Values;
+	internal ModuleInfo GetModuleInfoForModule(ICorDebugModule module) => _modules[module.BaseAddress];
 
-		var fileName = Path.GetFileName(path);
-		return fileName.EndsWith(".g.cs", StringComparison.OrdinalIgnoreCase) ||
-			fileName.EndsWith(".AssemblyAttributes.cs", StringComparison.OrdinalIgnoreCase);
+	internal ICorDebugValue? GetCurrentException(ThreadId threadId)
+	{
+		var thread = _process?.GetThread(threadId.Value);
+		if (thread is null) return null;
+		thread.TryGetCurrentException(out var currentException);
+		return currentException;
 	}
 
 	// Not intended to implement IDisposable - it is intended that this is called via Disconnect()
 	private void Dispose()
 	{
+		if (_process is null) return; // A client may call Terminate, then Disconnect, both of which call Dispose. Dispose only needs to be run once.
+
 		// Dispose modules, which releases PDB files
 		foreach (var moduleInfo in _modules.Values)
 		{
@@ -548,14 +501,21 @@ public partial class ManagedDebugger
 		_modules.Clear();
 
 		// Deactivate all breakpoints
-		foreach (var bp in _breakpointManager.GetAllBreakpoints().Where(b => b.CorBreakpoint is not null))
+		if (_entryBreakpoint is { } entryBreakpoint)
 		{
-			var hResult = bp.CorBreakpoint!.TryActivate(false);
-			if (hResult is HRESULT.CORDBG_E_PROCESS_TERMINATED)
+			entryBreakpoint.CorBreakpoint.TryActivate(false);
+			_entryBreakpoint = null;
+		}
+		_stopAtEntry = false;
+		foreach (var bp in _breakpointManager.GetAllBreakpoints().Where(b => (b.CorBreakpoint is not null && b.IsFunctionBreakpoint is false) || b.IsFunctionBreakpoint))
+		{
+			var corBreakpoints = bp.IsFunctionBreakpoint ? bp.FunctionBindings.Select(binding => binding.CorBreakpoint) : [bp.CorBreakpoint!];
+			foreach (var corBreakpoint in corBreakpoints)
 			{
-				break;
+				var hResult = corBreakpoint.TryActivate(false);
+				if (hResult is Cor.CORDBG_E_PROCESS_TERMINATED) break;
+				if (hResult is not Cor.S_OK) _logger?.Invoke($"Failed to deactivate breakpoint {bp.Id}: {hResult}");
 			}
-			if (hResult is not HRESULT.S_OK) _logger?.Invoke($"Failed to deactivate breakpoint during Dispose at {bp.FilePath}:{bp.Line}: {hResult}");
 		}
 		_breakpointManager.Clear();
 
@@ -563,24 +523,41 @@ public partial class ManagedDebugger
 		_asyncStepper = null;
 		_stepper = null!;
 		_threads.Clear();
+		_exceptionStates.Clear();
+		_exceptionBreakModes.Clear();
+		_initializedStaticTypes.Clear();
+		_suppressFinalizeFunction = null;
 		_variableManager.ClearAndTryDisposeHandleValues();
 		_frameReferenceManager.Clear();
 
 		// Unsubscribe from callbacks to avoid any further event dispatch
-		_callbacks.OnAnyEvent -= OnAnyEvent;
+		_callbacks.OnAnyEvent -= QueueEvent;
+		_runtimeEventChannel.Writer.Complete();
+		// ProcessRuntimeEventQueue is blocked on DapRequestAndRuntimeEventLock (which we hold) and would
+		// never complete if we waited on it here — that is the deadlock. Read and discard remaining events ourselves,
+		// then let the processor exit once the lock is released.
+		while (_runtimeEventChannel.Reader.TryRead(out _)) { }
 
 		// Detach from the process
 		_process?.TryDetach();
-		if (!_keepOutputReaders)
-		{
-			_launchedProcess?.Dispose();
-			_launchedProcess = null;
-		}
 
 		_isAttached = false;
 		_process = null;
-		_processId = 0;
 		_corDebug = null;
+
+		_debuggeeProcess?.Dispose();
+		_debuggeeProcess = null;
+	}
+
+	private sealed class ExceptionPropagationState
+	{
+		// True once exception propagation has entered a JMC-marked frame. If the runtime later finds a
+		// handler outside JMC code, the exception is user-unhandled.
+		public required bool HasReachedUserCode { get; set; }
+
+		// Prevents the first-chance and user-first-chance callbacks for the same exception from producing
+		// duplicate "all exceptions" stops.
+		public required bool AlwaysStopReported { get; set; }
 	}
 }
 

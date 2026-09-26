@@ -2,7 +2,9 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 using Ardalis.GuardClauses;
-using ClrDebug;
+using ICorDebugSharp;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 using SharpDbg.Infrastructure.Debugger.ExpressionEvaluator;
 using SharpDbg.Infrastructure.Debugger.ExpressionEvaluator.Compiler;
 using SharpDbg.Infrastructure.Debugger.Models;
@@ -13,13 +15,9 @@ using ZLinq;
 namespace SharpDbg.Infrastructure.Debugger;
 
 public record SharpDbgBreakpointRequest(int Line, string? Condition = null, string? HitCondition = null, int? Column = null);
-
-public record SharpDbgIlBreakpointRequest(
-    string MethodName,
-    int IlOffset,
-    string? ModuleName = null,
-    string? Condition = null,
-    string? HitCondition = null);
+public record SharpDbgFunctionBreakpointRequest(string Name, string? Condition = null, string? HitCondition = null);
+public record SharpDbgExceptionBreakpointRequest(SharpDbgExceptionBreakpointFilter Filter, string? Condition = null);
+public enum SharpDbgExceptionBreakpointFilter { All, UserUnhandled }
 
 public partial class ManagedDebugger
 {
@@ -32,15 +30,17 @@ public partial class ManagedDebugger
 	/// </summary>
 	public void Launch(LaunchInfo launchInfo, bool justMyCode)
 	{
+		EnsureNoProcessBeingDebugged();
 		_logger?.Invoke($"Launching program: {launchInfo.Program} {string.Join(' ', launchInfo.Arguments)}");
 		_justMyCode = justMyCode;
+		_stopAtEntry = launchInfo.StopAtEntry;
 		_pendingLaunchInfo = launchInfo;
 	}
 
 	/// <summary>
 	/// Actually perform the launch using DbgShim APIs
 	/// </summary>
-	private void PerformLaunch()
+	private async Task PerformLaunch()
 	{
 		if (_pendingLaunchInfo is null)
 		{
@@ -50,11 +50,8 @@ public partial class ManagedDebugger
 
 		var launchInfo = _pendingLaunchInfo;
 		_pendingLaunchInfo = null;
-
-		// Initialize DbgShim
-		var dbgshim = new DbgShim(NativeLibrary.Load("dbgshim", typeof(ManagedDebugger).Assembly, null));
-
 		var isDll = Path.GetExtension(launchInfo.Program).Equals(".dll", StringComparison.OrdinalIgnoreCase);
+
 		var processStartInfo = new ProcessStartInfo
 		{
 			FileName = isDll ? "dotnet" : launchInfo.Program,
@@ -65,8 +62,7 @@ public partial class ManagedDebugger
 			RedirectStandardError = true,
 			RedirectStandardInput = false,
 		};
-		if (isDll)
-			processStartInfo.ArgumentList.Add(launchInfo.Program);
+		if (isDll) processStartInfo.ArgumentList.Add(launchInfo.Program);
 		foreach (var arg in launchInfo.Arguments)
 		{
 			processStartInfo.ArgumentList.Add(arg);
@@ -80,42 +76,48 @@ public partial class ManagedDebugger
 
 		var process = Process.Start(processStartInfo);
 		if (process is null) throw new InvalidOperationException("Process start failed");
-		_launchedProcess = process;
-		process.EnableRaisingEvents = true;
-		process.Exited += (_, _) =>
+		_debuggeeProcess = process;
+
+		process.OutputDataReceived += (_, e) =>
 		{
-			int? exitCode = null;
-			try { process.WaitForExit(); exitCode = process.ExitCode; } catch { /* Reader may already be disposed. */ }
-			_launchedProcessExitCode = exitCode;
-			ReportProcessExit(exitCode);
-			process.Dispose();
-			if (ReferenceEquals(_launchedProcess, process)) _launchedProcess = null;
+			if (e.Data is not null) InvokeOnOutputWithTryCatch(e.Data + Environment.NewLine, isError: false);
 		};
-		process.OutputDataReceived += (_, args) =>
+		process.ErrorDataReceived += (_, e) =>
 		{
-			if (args.Data is not null) OnTargetOutput?.Invoke("stdout", args.Data);
-		};
-		process.ErrorDataReceived += (_, args) =>
-		{
-			if (args.Data is not null) OnTargetOutput?.Invoke("stderr", args.Data);
+			if (e.Data is not null) InvokeOnOutputWithTryCatch(e.Data + Environment.NewLine, isError: true);
 		};
 		process.BeginOutputReadLine();
 		process.BeginErrorReadLine();
 
-		_processId = process.Id;
-		var processId = _processId;
+		var processId = process.Id;
 
 		_logger?.Invoke($"Process created suspended with PID: {processId}");
 
-		_corDebug = ClrDebugExtensions.Automatic(dbgshim, processId, true);
+		_corDebug = await ClrDebugExtensions.Automatic(processId, true);
 		_corDebug.Initialize();
 		_corDebug.SetManagedHandler(_callbacks);
 
 		_process = _corDebug.DebugActiveProcess(processId, false);
 		_isAttached = true;
+		ConfigureExceptionCallbacks();
 
 		_logger?.Invoke($"Successfully attached to process: {processId}");
+		OnProcessStarted?.Invoke(processId, launchInfo.Program);
 		SendAllBreakpointEvents();
+		return;
+
+		// The DataReceived callbacks run on background threads - a throwing subscriber (e.g. a disposed protocol layer) must not crash the adapter
+		void InvokeOnOutputWithTryCatch(string output, bool isError)
+		{
+			try
+			{
+				OnOutput?.Invoke(output, isError);
+			}
+			catch (Exception ex)
+			{
+				_logger?.Invoke($"Error forwarding debuggee output: {ex.Message}");
+			}
+		}
 	}
 
 	public bool RemoveBreakpoint(int id)
@@ -142,14 +144,18 @@ public partial class ManagedDebugger
 	/// </summary>
 	public void Attach(int processId, bool justMyCode)
 	{
+		EnsureNoProcessBeingDebugged();
 		_logger?.Invoke($"Storing attach target: {processId}");
 		_justMyCode = justMyCode;
+		_stopAtEntry = false;
 		_pendingAttachProcessId = processId;
 	}
 
 	public void AttachRemote(RemoteAttachInfo remoteAttachInfo, bool justMyCode)
 	{
+		EnsureNoProcessBeingDebugged();
 		_justMyCode = justMyCode;
+		_stopAtEntry = false;
 		_pendingRemoteAttachInfo = remoteAttachInfo;
 		_isRemoteAttach = true;
 	}
@@ -166,22 +172,22 @@ public partial class ManagedDebugger
 		{
 			var launchedProcessId = await Task.Run(() => SendRunInTerminalRequest.Invoke(_pendingLaunchInfo)); // get off the dispatcher thread
 			_pendingLaunchInfo = null;
-			await PerformAttach(launchedProcessId);
+			PerformAttach(launchedProcessId);
 			await DiagnosticClientHelper.DiagnosticClientResumeRuntime(launchedProcessId);
 		}
 		else if (_pendingLaunchInfo is not null) // If we have a pending launch, perform it
 		{
-			PerformLaunch();
+			await PerformLaunch();
 		}
 		else if (_pendingRemoteAttachInfo is not null)
 		{
-			await PerformRemoteAttach(_pendingRemoteAttachInfo);
+			PerformRemoteAttach(_pendingRemoteAttachInfo);
 			_pendingRemoteAttachInfo = null;
 		}
 		// Otherwise check for pending attach
 		else if (_pendingAttachProcessId.HasValue)
 		{
-			await PerformAttach(_pendingAttachProcessId.Value);
+			PerformAttach(_pendingAttachProcessId.Value);
 			_pendingAttachProcessId = null;
 		}
 	}
@@ -192,7 +198,18 @@ public partial class ManagedDebugger
 	public void HandleContinueRequest()
 	{
 		_logger?.Invoke("Continue");
-		ContinueWithVariableClear();
+		ContinueWithVariableClearAllowSuperfluousContinue();
+	}
+
+	private void ContinueWithVariableClearAllowSuperfluousContinue()
+	{
+		Guard.Against.Null(_process);
+		_variableManager.ClearAndDisposeHandleValues();
+		_frameReferenceManager.Clear();
+
+		var result = _process.TryContinue(false);
+		if (result is Cor.CORDBG_E_SUPERFLOUS_CONTINUE) return;
+		Marshal.ThrowExceptionForHR(result);
 	}
 
 	private void ContinueWithVariableClear()
@@ -200,8 +217,7 @@ public partial class ManagedDebugger
 		Guard.Against.Null(_process);
 		_variableManager.ClearAndDisposeHandleValues();
 		_frameReferenceManager.Clear();
-		if (_process.TryIsRunning(out var isRunning) is HRESULT.S_OK && isRunning)
-			return;
+
 		_process.Continue(false);
 	}
 
@@ -212,23 +228,22 @@ public partial class ManagedDebugger
 	{
 		_logger?.Invoke("Pause");
 		Guard.Against.Null(_process);
-		if (_process.IsRunning)
-		{
-			_process.Stop(0);
-			_asyncStepper?.Disable();
-		}
+		if (_process.IsRunning is false) throw new InvalidOperationException("The process is not running, so it cannot be paused - it has either already stopped or has not finished starting");
+		_process.Stop(0);
+		_asyncStepper?.Disable();
 	}
 
 	/// <summary>
 	/// Step to the next line
 	/// </summary>
-	public async void StepNext(int threadId)
+	public async Task StepNext(int threadId)
 	{
 		_logger?.Invoke($"StepNext on thread {threadId}");
-		if (_threads.TryGetValue(threadId, out var thread))
+		if (_threads.TryGetValue(threadId, out var threadInfo))
 		{
+			var thread = threadInfo.Thread;
 			var frame = thread.ActiveFrame;
-			if (frame is not CorDebugILFrame ilFrame) throw new InvalidOperationException("Active frame is not an IL frame");
+			if (frame is not ICorDebugILFrame ilFrame) throw new InvalidOperationException("Active frame is not an IL frame");
 			if (_stepper is not null) throw new InvalidOperationException("A step operation is already in progress");
 
 			// Try async stepping first
@@ -253,11 +268,12 @@ public partial class ManagedDebugger
 	/// <summary>
 	/// Step into
 	/// </summary>
-	public async void StepIn(int threadId)
+	public async Task StepIn(int threadId)
 	{
 		_logger?.Invoke($"StepIn on thread {threadId}");
-		if (_threads.TryGetValue(threadId, out var thread))
+		if (_threads.TryGetValue(threadId, out var threadInfo))
 		{
+			var thread = threadInfo.Thread;
 			var frame = thread.ActiveFrame;
 			if (frame is not null)
 			{
@@ -284,11 +300,12 @@ public partial class ManagedDebugger
 	/// <summary>
 	/// Step out
 	/// </summary>
-	public async void StepOut(int threadId)
+	public async Task StepOut(int threadId)
 	{
 		_logger?.Invoke($"StepOut on thread {threadId}");
-		if (_threads.TryGetValue(threadId, out var thread))
+		if (_threads.TryGetValue(threadId, out var threadInfo))
 		{
+			var thread = threadInfo.Thread;
 			var frame = thread.ActiveFrame;
 			if (frame is not null)
 			{
@@ -346,6 +363,12 @@ public partial class ManagedDebugger
 		foreach (var request in breakpoints)
 		{
 			var bp = _breakpointManager.CreateBreakpoint(filePath, request.Line, request.Column, request.Condition, request.HitCondition);
+			if (request.Condition is not null && SyntaxFactory.ParseExpression(request.Condition).DescendantNodesAndSelf().Any(static node => node is AnonymousFunctionExpressionSyntax))
+			{
+				bp.Message = "Lambda expressions are not supported in breakpoint conditions.";
+				result.Add(bp);
+				continue;
+			}
 
 			// Try to bind the breakpoint if we have a process
 			if (_process is not null)
@@ -364,56 +387,39 @@ public partial class ManagedDebugger
 		return result;
 	}
 
-	/// <summary>
-	/// Set IL-level breakpoints for a method
-	/// </summary>
-	public List<BreakpointManager.BreakpointInfo> SetIlBreakpoints(string methodKey, SharpDbgIlBreakpointRequest[] breakpoints)
+	public List<BreakpointManager.BreakpointInfo> SetFunctionBreakpoints(SharpDbgFunctionBreakpointRequest[] breakpoints)
 	{
-		_logger?.Invoke($"SetIlBreakpoints: {methodKey}, breakpoints: {string.Join(",", breakpoints.Select(b => $"IL_{b.IlOffset:X4}"))}");
-
-		// Deactivate and clear existing IL breakpoints for this method
-		var existingBreakpoints = _breakpointManager.GetBreakpointsForMethod(methodKey);
-		foreach (var bp in existingBreakpoints)
+		foreach (var bp in _breakpointManager.GetFunctionBreakpoints())
 		{
-			if (bp.CorBreakpoint is not null)
+			foreach (var binding in bp.FunctionBindings)
 			{
-				try
-				{
-					bp.CorBreakpoint.Activate(false);
-				}
-				catch (Exception ex)
-				{
-					_logger?.Invoke($"Error deactivating IL breakpoint: {ex.Message}");
-				}
+				try { binding.CorBreakpoint.Activate(false); }
+				catch (Exception ex) { _logger?.Invoke($"Error deactivating function breakpoint: {ex.Message}"); }
 			}
 		}
-		_breakpointManager.ClearBreakpointsForMethod(methodKey);
+		_breakpointManager.ClearFunctionBreakpoints();
 
-		// Create new breakpoints
 		var result = new List<BreakpointManager.BreakpointInfo>();
 		foreach (var request in breakpoints)
 		{
-			var bp = _breakpointManager.CreateIlBreakpoint(
-				methodKey,
-				request.MethodName,
-				request.IlOffset,
-				request.ModuleName,
-				request.Condition,
-				request.HitCondition);
-
-			// Try to bind the breakpoint if we have a process
-			if (_process is not null)
+			var bp = _breakpointManager.CreateFunctionBreakpoint(request.Name, request.Condition, request.HitCondition);
+			try
 			{
-				TryBindIlBreakpoint(bp);
+				_ = FunctionBreakpointPattern.Parse(request.Name);
+				foreach (var module in _modules.Values)
+				{
+					TryBindFunctionBreakpoint(bp, module);
+				}
+				if (!bp.Verified) bp.Message = _process is null
+					? "Breakpoint has not been processed by the debugger."
+					: $"No functions matching '{request.Name}' were found.";
 			}
-			else
+			catch (ArgumentException ex)
 			{
-				bp.Message = "Breakpoint has not been processed by the debugger.";
+				bp.Message = ex.Message;
 			}
-
 			result.Add(bp);
 		}
-
 		return result;
 	}
 
@@ -427,10 +433,10 @@ public partial class ManagedDebugger
 
 		try
 		{
-			var threads = _process.EnumerateThreads();
-			foreach (var thread in threads)
+			foreach (var (id, threadInfo) in _threads)
 			{
-				result.Add((thread.Id, $"Thread {thread.Id}"));
+				threadInfo.Name ??= threadInfo.Thread.GetThreadNameOrNull();
+				result.Add((id, threadInfo.Name ?? "<No Name>"));
 			}
 		}
 		catch (Exception ex)
@@ -444,64 +450,53 @@ public partial class ManagedDebugger
 	/// <summary>
 	/// Get stack trace for a thread
 	/// </summary>
-	public List<StackFrameInfo> GetStackTrace(int threadId, int startFrame = 0, int? levels = null)
+	public List<StackFrameInfo> GetStackTrace(int threadIdInt, int startFrame = 0, int? levels = null)
 	{
 		var result = new List<StackFrameInfo>();
 
-		if (_process is null)
+		if (!_threads.TryGetValue(threadIdInt, out var threadInfo))
+		{
 			return result;
-
-		var thread = _process.Threads.FirstOrDefault(t => t.Id == threadId);
-		if (thread is null)
-			return result;
+		}
+		var thread = threadInfo.Thread;
 
 		try
 		{
-			var chains = thread.EnumerateChains();
-			foreach (var chain in chains)
+			var endFrame = levels is null ? long.MaxValue : (long)startFrame + levels.Value;
+			var index = 0;
+
+			// Physical frames come first and are enumerated lazily, so a request for the topmost frames does not
+			// have to walk the entire stack. We store the IL frames so their synthetic async caller frames can be
+			// appended after all physical frames, once enumeration reaches past them.
+			var ilFramesForSyntheticAsyncFrames = new List<(int physicalDepth, ICorDebugILFrame frame)>();
+			var threadId = new ThreadId(threadIdInt);
+			foreach (var (physicalDepth, frame) in EnumerateFramesForThread(thread).AsValueEnumerable().Index())
 			{
-				var frames = chain.Frames;
-				var filterFrames = frames.AsValueEnumerable().Skip(startFrame).Take(levels ?? int.MaxValue);
-
-				foreach (var (index, frame) in filterFrames.Index())
+				if (index >= endFrame) return result;
+				if (index >= startFrame)
 				{
-					if (frame is CorDebugILFrame ilFrame)
+					var frameId = _frameReferenceManager.GetOrCreateFrameId(threadId, new FrameStackDepth(physicalDepth));
+					result.Add(CreateStackFrameInfo(frameId, frame, false));
+				}
+				if (frame is ICorDebugILFrame ilFrame) ilFramesForSyntheticAsyncFrames.Add((physicalDepth, ilFrame));
+				index++;
+			}
+
+			foreach (var (physicalDepth, ilFrame) in ilFramesForSyntheticAsyncFrames)
+			{
+				var physicalFrameStackDepth = new FrameStackDepth(physicalDepth);
+				foreach (var (syntheticFrameIndex, syntheticFrame) in GetSyntheticAsyncCallerFrames(ilFrame).AsValueEnumerable().Index())
+				{
+					if (index >= endFrame) return result;
+					if (index < startFrame)
 					{
-						var function = ilFrame.Function;
-
-						var frameId = _frameReferenceManager.GetOrCreateFrameId(new ThreadId(threadId), new FrameStackDepth(startFrame + index));
-						var module = _modules[function.Module.BaseAddress];
-						var line = 0;
-						var column = 0;
-						var endLine = 0;
-						var endColumn = 0;
-						string? sourceFilePath = null;
-						if (module.SymbolReader is not null)
-						{
-							var ilOffset = ilFrame.IP.pnOffset;
-							var methodToken = function.Token;
-							var sourceInfo = module.SymbolReader.GetSourceLocationForOffset(methodToken, ilOffset);
-							if (sourceInfo is not null)
-							{
-								line = sourceInfo.Value.startLine;
-								column = sourceInfo.Value.startColumn;
-								endLine = sourceInfo.Value.endLine;
-								endColumn = sourceInfo.Value.endColumn;
-								sourceFilePath = sourceInfo.Value.sourceFilePath;
-							}
-						}
-
-						result.Add(new StackFrameInfo
-						{
-							Id = frameId,
-							Name = GetFunctionFormattedName(function),
-							Line = line,
-							EndLine = endLine,
-							Column = column,
-							EndColumn = endColumn,
-							Source = sourceFilePath
-						});
+						index++;
+						continue;
 					}
+					index++;
+
+					var syntheticFrameId = _frameReferenceManager.GetOrCreateSyntheticAsyncFrameId(threadId, physicalFrameStackDepth, syntheticFrameIndex, syntheticFrame);
+					result.Add(CreateSyntheticAsyncStackFrameInfo(syntheticFrameId, threadId, physicalFrameStackDepth, syntheticFrame, decompileIfNeeded: false));
 				}
 			}
 		}
@@ -513,6 +508,84 @@ public partial class ManagedDebugger
 		return result;
 	}
 
+	public StackFrameInfo ResolveStackFrame(int frameId)
+	{
+		var syntheticFrame = _frameReferenceManager.GetSyntheticAsyncFrameById(frameId);
+		if (syntheticFrame is not null) return CreateSyntheticAsyncStackFrameInfo(frameId, syntheticFrame.Value.threadId, syntheticFrame.Value.physicalFrameStackDepth, syntheticFrame.Value.frame, decompileIfNeeded: true);
+		var frameInfo = _frameReferenceManager.GetFrameInfoById(frameId) ?? throw new ArgumentException($"Unknown stack frame ID '{frameId}'.", nameof(frameId));
+		var frame = GetFrameForThreadIdAndStackDepth(frameInfo.threadId, frameInfo.frameStackDepth);
+		if (frame is not ICorDebugILFrame) throw new InvalidOperationException($"Stack frame '{frameId}' cannot be resolved because it is not an IL frame.");
+
+		return CreateStackFrameInfo(frameId, frame, true);
+	}
+
+	private StackFrameInfo CreateStackFrameInfo(int frameId, ICorDebugFrame frame, bool decompileIfNeeded)
+	{
+		var stackFrameInfo = new StackFrameInfo
+		{
+			Id = frameId,
+			Name = null!,
+			Line = 0,
+			EndLine = null,
+			Column = 0,
+			EndColumn = null,
+			Source = null,
+			IsUserCode = false,
+			IsResolved = true,
+			DecompiledSourceInfo = null
+		};
+
+		if (frame is ICorDebugILFrame ilFrame)
+		{
+			var function = ilFrame.Function;
+			var module = _modules[function.Module.BaseAddress];
+			// returns null if the function is not a state machine method
+			var kickoffMethodToken = module.MetadataReader.GetStateMachineKickoffMethodToken(function.Token);
+			stackFrameInfo.Name = GetMethodFormattedName(module, kickoffMethodToken ?? function.Token, ilFrame.TypeParameters);
+			var sourceInfo = GetSourceInfoAtFrame(ilFrame, decompileIfNeeded);
+			stackFrameInfo.IsUserCode = module.IsUserCode;
+			stackFrameInfo.IsResolved = module.MetadataReader.HasSymbols;
+			if (sourceInfo is not null)
+			{
+				stackFrameInfo.Line = sourceInfo.Value.StartLine;
+				stackFrameInfo.EndLine = sourceInfo.Value.EndLine;
+				stackFrameInfo.Column = sourceInfo.Value.StartColumn;
+				stackFrameInfo.EndColumn = sourceInfo.Value.EndColumn;
+				stackFrameInfo.Source = sourceInfo.Value.FilePath;
+				stackFrameInfo.DecompiledSourceInfo = sourceInfo.Value.DecompiledSourceInfo;
+			}
+		}
+		else if (frame is ICorDebugInternalFrame internalFrame)
+		{
+			stackFrameInfo.Name = internalFrame.FrameType.ToDisplayName();
+		}
+		else if (frame is ICorDebugNativeFrame)
+		{
+			stackFrameInfo.Name = "[Native Frame]";
+		}
+		else throw new ArgumentOutOfRangeException(nameof(frame), "Unknown frame type");
+
+		return stackFrameInfo;
+	}
+
+	private StackFrameInfo CreateSyntheticAsyncStackFrameInfo(int frameId, ThreadId threadId, FrameStackDepth physicalFrameStackDepth, SyntheticAsyncCallerFrame frame, bool decompileIfNeeded)
+	{
+		var source = GetSyntheticAsyncFrameSourceInfo(frame, threadId, physicalFrameStackDepth, decompileIfNeeded);
+		return new StackFrameInfo
+		{
+			Id = frameId,
+			Name = frame.Name,
+			Line = source?.StartLine ?? 0,
+			EndLine = source?.EndLine,
+			Column = source?.StartColumn ?? 0,
+			EndColumn = source?.EndColumn,
+			Source = source?.FilePath,
+			IsUserCode = frame.Module.IsUserCode,
+			IsResolved = frame.Module.MetadataReader.HasSymbols,
+			DecompiledSourceInfo = source?.DecompiledSourceInfo
+		};
+	}
+
 	/// <summary>
 	/// Get scopes for a stack frame
 	/// </summary>
@@ -520,14 +593,24 @@ public partial class ManagedDebugger
 	{
 		var result = new List<ScopeInfo>();
 
+		var syntheticFrame = _frameReferenceManager.GetSyntheticAsyncFrameById(frameId);
+		if (syntheticFrame is not null)
+		{
+			var syntheticLocalsReference = _variableManager.CreateReference(new VariablesReference(StoredReferenceKind.SyntheticAsyncScope,
+				syntheticFrame.Value.frame.StateMachine, syntheticFrame.Value.threadId, syntheticFrame.Value.physicalFrameStackDepth, null));
+			result.Add(new ScopeInfo { Name = "Locals", VariablesReference = syntheticLocalsReference, Expensive = false });
+			return result;
+		}
 		var frameInfo = _frameReferenceManager.GetFrameInfoById(frameId);
 		if (frameInfo is not var (threadId, frameStackDepth)) return result;
 		var frame = GetFrameForThreadIdAndStackDepth(threadId, frameStackDepth);
+		if (frame is not ICorDebugILFrame ilFrame) return result;
 
-		var localVariables = frame.LocalVariables;
-		var arguments = frame.Arguments;
-		var thread = _process!.Threads.Single(s => s.Id == threadId.Value);
-		var hasCurrentException = thread.TryGetCurrentException(out _) is HRESULT.S_OK;
+		var localVariables = ilFrame.LocalVariables;
+		var arguments = ilFrame.Arguments;
+		var thread = _threads.GetValueOrDefault(threadId.Value)?.Thread;
+		Guard.Against.Null(thread);
+		var hasCurrentException = thread.TryGetCurrentException(out _) is Cor.S_OK;
 		if (localVariables.Length is 0 && arguments.Length is 0 && !hasCurrentException) return result;
 
 		// can this just be the same reference?
@@ -550,16 +633,21 @@ public partial class ManagedDebugger
 
 		var variablesReferenceNullable = _variableManager.GetReference(variablesReferenceInt);
 		if (variablesReferenceNullable is not {} variablesReference) throw new ArgumentException("Invalid variables reference");
-		var ilFrame = GetFrameForThreadIdAndStackDepth(variablesReference.ThreadId, variablesReference.FrameStackDepth);
 		try
 		{
 			if (variablesReference.ReferenceKind is StoredReferenceKind.Scope)
 			{
+				var ilFrame = GetIlFrameForThreadIdAndStackDepth(variablesReference.ThreadId, variablesReference.FrameStackDepth);
 				var corDebugFunction = ilFrame.Function;
 				var module = _modules[corDebugFunction.Module.BaseAddress];
 				await AddCurrentException(result, variablesReference.ThreadId, variablesReference.FrameStackDepth);
 				var classContainingHoistedLocalsValue = await AddArguments(module, corDebugFunction, result, variablesReference.ThreadId, variablesReference.FrameStackDepth);
 				await AddLocalVariables(module, corDebugFunction, result, variablesReference.ThreadId, variablesReference.FrameStackDepth, classContainingHoistedLocalsValue);
+			}
+			else if (variablesReference.ReferenceKind is StoredReferenceKind.SyntheticAsyncScope)
+			{
+				var stateMachine = variablesReference.ObjectValue!;
+				await AddMembers(stateMachine, stateMachine.ExactType, variablesReference.ThreadId, variablesReference.FrameStackDepth, result);
 			}
 			else if (variablesReference.ReferenceKind is StoredReferenceKind.StackVariable)
 			{
@@ -568,7 +656,7 @@ public partial class ManagedDebugger
 					// get the public members of the debugger proxy instance instead
 					var objectValue = variablesReference.DebuggerProxyInstance.UnwrapDebugValueToObject();
 					await AddMembersAndStaticPseudoVariable(variablesReference.DebuggerProxyInstance, objectValue.ExactType, variablesReference.ThreadId, variablesReference.FrameStackDepth, result, false);
-					var rawValueVariablesReference = _variableManager.CreateReference(new VariablesReference(StoredReferenceKind.StackVariable, variablesReference.ObjectValue, variablesReference.ThreadId, variablesReference.FrameStackDepth, null));
+					var rawValueVariablesReference = _variableManager.CreateReference(new VariablesReference(StoredReferenceKind.RawView, variablesReference.ObjectValue, variablesReference.ThreadId, variablesReference.FrameStackDepth, null));
 					var rawValuePseudoVariable = new VariableInfo
 					{
 						Name = "Raw View",
@@ -582,13 +670,20 @@ public partial class ManagedDebugger
 				}
 				var unwrappedDebugValue = variablesReference.ObjectValue!.UnwrapDebugValue();
 
-				if (unwrappedDebugValue is CorDebugArrayValue arrayValue)
+				if (unwrappedDebugValue is ICorDebugArrayValue arrayValue)
 				{
-					await AddArrayElements(arrayValue, variablesReference.ThreadId, variablesReference.FrameStackDepth, result);
+					await AddArrayElements(arrayValue, variablesReference.ThreadId, variablesReference.FrameStackDepth, result, referenceValue: variablesReference.ObjectValue);
 				}
-				else if (unwrappedDebugValue is CorDebugObjectValue objectValue)
+				else if (unwrappedDebugValue is ICorDebugObjectValue objectValue)
 				{
-					await AddMembersAndStaticPseudoVariable(variablesReference.ObjectValue!, objectValue.ExactType, variablesReference.ThreadId, variablesReference.FrameStackDepth, result);
+					if (IsEnumerable(objectValue.ExactType))
+					{
+						AddEnumerablePseudoVariables(variablesReference, result);
+					}
+					else
+					{
+						await AddMembersAndStaticPseudoVariable(variablesReference.ObjectValue!, objectValue.ExactType, variablesReference.ThreadId, variablesReference.FrameStackDepth, result);
+					}
 				}
 				else
 				{
@@ -599,6 +694,20 @@ public partial class ManagedDebugger
 			{
 				var objectValue = variablesReference.ObjectValue!.UnwrapDebugValueToObject();
 				await AddStaticMembers(variablesReference.ObjectValue!, objectValue.ExactType, variablesReference.ThreadId, variablesReference.FrameStackDepth, result);
+			}
+			else if (variablesReference.ReferenceKind is StoredReferenceKind.RawView)
+			{
+				var objectValue = variablesReference.ObjectValue!.UnwrapDebugValueToObject();
+				await AddMembersAndStaticPseudoVariable(variablesReference.ObjectValue!, objectValue.ExactType, variablesReference.ThreadId, variablesReference.FrameStackDepth, result);
+			}
+			else if (variablesReference.ReferenceKind is StoredReferenceKind.EnumerableResults)
+			{
+				await AddEnumerableResults(variablesReference, result);
+			}
+			else if (variablesReference.ReferenceKind is StoredReferenceKind.ArrayRange)
+			{
+				var arrayValue = (ICorDebugArrayValue)variablesReference.ObjectValue!.UnwrapDebugValue();
+				await AddArrayElements(arrayValue, variablesReference.ThreadId, variablesReference.FrameStackDepth, result, variablesReference.ArrayIndices, variablesReference.ArrayStartOffset, variablesReference.ArrayCount, variablesReference.ObjectValue);
 			}
 		}
 		catch (Exception ex)
@@ -613,28 +722,47 @@ public partial class ManagedDebugger
 	/// <summary>
 	/// Evaluate an expression
 	/// </summary>
-	public async Task<(string result, string? type, int variablesReference)> Evaluate(string expression, int? frameId)
+	public async Task<VariableInfo> Evaluate(string expression, int? frameId)
 	{
 		_logger?.Invoke($"Evaluate: {expression}");
 		if (frameId is null or 0) throw new InvalidOperationException("Frame ID is required for evaluation");
+		if (_frameReferenceManager.GetSyntheticAsyncFrameById(frameId.Value) is not null)
+			throw new InvalidOperationException("Expression evaluation is not supported for synthetic async caller frames");
 
 		var frameInfo = _frameReferenceManager.GetFrameInfoById(frameId.Value);
 		if (frameInfo is not var (threadId, frameStackDepth)) throw new InvalidOperationException("Frame ID does not exist");
-		var thread = _process!.Threads.Single(s => s.Id == threadId.Value);
+		var thread = _threads.GetValueOrDefault(threadId.Value)?.Thread;
+		Guard.Against.Null(thread);
 
-		var compiledExpression = ExpressionCompiler.Compile(expression, false);
 		var evalContext = new CompiledExpressionEvaluationContext(thread, threadId, frameStackDepth);
-		ArgumentNullException.ThrowIfNull(_expressionInterpreter);
-		var result = await _expressionInterpreter.Interpret(compiledExpression, evalContext);
+		ArgumentNullException.ThrowIfNull(_expressionEvaluator);
+		using var result = await _expressionEvaluator.Evaluate(expression, evalContext);
 
 		if (result.Error is not null)
 		{
 			_logger?.Invoke($"Evaluation error: {result.Error}");
-			return (result.Error, null, 0);
+			return new VariableInfo
+			{
+				Name = null!,
+				Value = result.Error,
+				Type = null,
+				PresentationHint = new VariablePresentationHint { Attributes = AttributesValue.FailedEvaluation },
+				VariablesReference = 0
+			};
 		}
-		var (friendlyTypeName, value, debuggerProxyInstance, resultIsError) = await GetValueForCorDebugValueAsync(result.Value!, threadId, frameStackDepth);
-		// TODO: create variables reference. Just return a VariableInfo
-		return (value, friendlyTypeName, 0);
+		var (friendlyTypeName, value, debuggerProxyInstance, resultIsError) = await GetValueForCorDebugValueAsync(result.Value!, threadId, frameStackDepth, true);
+		VariablePresentationHint? variablePresentationHint = resultIsError ? new VariablePresentationHint { Attributes = AttributesValue.FailedEvaluation } : null;
+		var variablesReference = GetVariablesReference(result.Value!, friendlyTypeName, threadId, frameStackDepth, debuggerProxyInstance);
+		var variableInfo = new VariableInfo
+		{
+			Name = null!,
+			Value = value,
+			Type = friendlyTypeName,
+			PresentationHint = variablePresentationHint,
+			VariablesReference = variablesReference
+		};
+		if (variablesReference != 0) result.RelinquishResultHandleOwnership();
+		return variableInfo;
 	}
 
 	/// <summary>
@@ -647,6 +775,12 @@ public partial class ManagedDebugger
 		{
 			try
 			{
+				// CORDBG_E_PROCESS_NOT_SYNCHRONIZED is thrown if attempting to terminate a running process. We need to stop it first.
+				if (_process.TryIsRunning(out var isRunning) is Cor.S_OK && isRunning)
+				{
+					var stopResult = _process.TryStop(0);
+					if (stopResult is not (Cor.S_OK or Cor.CORDBG_E_PROCESS_TERMINATED)) _logger?.Invoke($"Error stopping process before terminating it: {stopResult}");
+				}
 				_process.Terminate(0);
 			}
 			catch (Exception ex)
@@ -670,11 +804,10 @@ public partial class ManagedDebugger
 		}
 		else
 		{
-			_keepOutputReaders = true;
-			if (_process is not null && _isAttached && _process?.TryIsRunning(out var isRunning) is HRESULT.S_OK && isRunning)
+			if (_process is not null && _isAttached && _process?.TryIsRunning(out var isRunning) is Cor.S_OK && isRunning)
 			{
 				var hResult = _process.TryStop(0);
-				if (hResult is not (HRESULT.S_OK or HRESULT.CORDBG_E_PROCESS_TERMINATED)) _logger?.Invoke($"Error stopping process during disconnect: {hResult}");
+				if (hResult is not (Cor.S_OK or Cor.CORDBG_E_PROCESS_TERMINATED)) _logger?.Invoke($"Error stopping process during disconnect: {hResult}");
 			}
 			Dispose();
 		}
@@ -684,19 +817,19 @@ public partial class ManagedDebugger
 	{
 		_logger?.Invoke($"ExceptionInfo for thread {threadId.Value}");
 		var thread = _process!.GetThread(threadId.Value);
-		if (thread.TryGetCurrentException(out var currentException) is not HRESULT.S_OK)
+		if (thread.TryGetCurrentException(out var currentException) is not Cor.S_OK)
 		{
 			_logger?.Invoke("No current exception");
 			throw new InvalidOperationException("No current exception on thread");
 		}
 
 		var frameStackDepth = new FrameStackDepth(0);
-		var (friendlyTypeName, _, _, _) = await GetValueForCorDebugValueAsync(currentException, threadId, frameStackDepth);
+		var (friendlyTypeName, _, _, _) = await GetValueForCorDebugValueAsync(currentException, threadId, frameStackDepth, false);
 
-		var (_, hResult, _, _) = await GetValueForCorDebugValueAsync((await currentException.GetPropertyValue(_callbacks, EvalStatus, (CorDebugILFrame)thread.ActiveFrame, "HResult"))!, threadId, frameStackDepth);
-		var (_, source, _, _) = await GetValueForCorDebugValueAsync((await currentException.GetPropertyValue(_callbacks, EvalStatus, (CorDebugILFrame)thread.ActiveFrame, "Source"))!, threadId, frameStackDepth);
-		var (_, message, _, _) = await GetValueForCorDebugValueAsync((await currentException.GetPropertyValue(_callbacks, EvalStatus, (CorDebugILFrame)thread.ActiveFrame, "Message"))!, threadId, frameStackDepth);
-		var (_, stackTrace, _, _) = await GetValueForCorDebugValueAsync((await currentException.GetPropertyValue(_callbacks, EvalStatus, (CorDebugILFrame)thread.ActiveFrame, "StackTrace"))!, threadId, frameStackDepth);
+		var hResult = await GetExceptionPropertyValue("HResult");
+		var source = await GetExceptionPropertyValue("Source");
+		var message = await GetExceptionPropertyValue("Message");
+		var stackTrace = await GetExceptionPropertyValue("StackTrace");
 
 		var typeNameSpan = friendlyTypeName.AsSpan();
 		var lastDot = typeNameSpan.LastIndexOf('.');
@@ -708,12 +841,7 @@ public partial class ManagedDebugger
 		{
 			ExceptionId = $"CLR/{friendlyTypeName}",
 			Description = $"Exception thrown: '{friendlyTypeName}' in {source}.dll: '{message}'",
-			BreakMode = ExceptionStopMode switch
-			{
-				ManagedExceptionStopMode.Unhandled => SharpDbgExceptionBreakMode.Unhandled,
-				ManagedExceptionStopMode.None => SharpDbgExceptionBreakMode.Never,
-				_ => SharpDbgExceptionBreakMode.Always,
-			},
+			BreakMode = _exceptionBreakModes.GetValueOrDefault(threadId, SharpDbgExceptionBreakMode.Unknown),
 			Code = 0,
 			Details = new ExceptionInfo.ExceptionDetails
 			{
@@ -729,5 +857,25 @@ public partial class ManagedDebugger
 			}
 		};
 		return exceptionInfo;
+
+		async Task<string> GetExceptionPropertyValue(string propertyName)
+		{
+			var propertyValue = await currentException.GetPropertyValue(ProcessRuntimeEventsUntilEvalEvent, EvalStatus, (ICorDebugILFrame)thread.ActiveFrame, propertyName)
+				?? throw new InvalidOperationException($"Exception property '{propertyName}' returned no value");
+			try
+			{
+				var (_, value, _, _) = await GetValueForCorDebugValueAsync(propertyValue, threadId, frameStackDepth, false);
+				return value;
+			}
+			finally
+			{
+				if (propertyValue is ICorDebugHandleValue handle) handle.TryDispose();
+			}
+		}
+	}
+
+	public void SetExceptionBreakpoints(IReadOnlyList<SharpDbgExceptionBreakpointRequest> breakpoints)
+	{
+		_exceptionBreakpoints = breakpoints.ToArray();
 	}
 }

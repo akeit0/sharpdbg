@@ -6,6 +6,7 @@ using Microsoft.VisualStudio.Shared.VSCodeDebugProtocol.Messages;
 using SharpDbg.Cli.Tests.Helpers;
 using SharpDbg.Infrastructure.Debugger;
 using SharpDbg.InMemory;
+using StackFrame = Microsoft.VisualStudio.Shared.VSCodeDebugProtocol.Messages.StackFrame;
 
 namespace SharpDbg.Cli.Tests;
 
@@ -14,8 +15,27 @@ public class TcsContainer
 	public required TaskCompletionSource<DebugEvent> Tcs { get; set; }
 }
 
+public enum DebugAdapterMode
+{
+	InProc,
+	OutOfProc
+}
+
 public static partial class TestHelper
 {
+	public const VariableReferenceComparison ReferenceComparison = VariableReferenceComparison.Exact;
+	public static (DisposableDebugProtocolHost, TaskCompletionSource InitializedEventTcs, TcsContainer debugEventTcs, IDisposable DebugAdapterDisposable, Process DebuggableProcess) GetRunningDebugProtocolHost(ITestOutputHelper testOutputHelper, bool startSuspended)
+	{
+		var debugAdapterMode = DebugAdapterMode.InProc;
+		var result = debugAdapterMode switch
+		{
+			DebugAdapterMode.InProc => GetRunningDebugProtocolHostInProc(testOutputHelper, startSuspended),
+			DebugAdapterMode.OutOfProc => GetRunningDebugProtocolHostOop(testOutputHelper, startSuspended),
+			_ => throw new NotImplementedException($"Debug adapter mode {debugAdapterMode} is not implemented.")
+		};
+		return result;
+	}
+
 	public static (DisposableDebugProtocolHost, TaskCompletionSource InitializedEventTcs, TcsContainer debugEventTcs, IDisposable DebugAdapterDisposable, Process DebuggableProcess) GetRunningDebugProtocolHostOop(ITestOutputHelper testOutputHelper, bool startSuspended)
 	{
 		var process = DebugAdapterProcessHelper.GetDebugAdapterProcess();
@@ -30,6 +50,17 @@ public static partial class TestHelper
 		{
 			testOutputHelper.WriteLine($"Log [SharpDbg]: {message}");
 		}
+	}
+
+	public static (DisposableDebugProtocolHost Host, TaskCompletionSource InitializedEventTcs, TcsContainer DebugEventTcs, IDisposable Adapter) GetLaunchDebugProtocolHostInProc(ITestOutputHelper testOutputHelper)
+	{
+		var (input, output, adapter) = SharpDbgInMemory.NewDebugAdapterStreams(message => testOutputHelper.WriteLine($"Log [SharpDbg]: {message}"));
+		var initializedEventTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+		var host = DebugAdapterProcessHelper.GetDebugProtocolHost(input, output, testOutputHelper, initializedEventTcs, terminateDebuggeeOnDispose: true);
+		var debugEventTcs = new TcsContainer { Tcs = new TaskCompletionSource<DebugEvent>(TaskCreationOptions.RunContinuationsAsynchronously) };
+		host.RegisterEventType<StoppedEvent>(@event => debugEventTcs.Tcs.TrySetResult(@event));
+		host.Run();
+		return (host, initializedEventTcs, debugEventTcs, adapter);
 	}
 
 	private static (DisposableDebugProtocolHost, TaskCompletionSource InitializedEventTcs, TcsContainer debugEventTcs, IDisposable DebugAdapterDisposable, Process DebuggableProcess) GetRunningDebugProtocolHostCore(ITestOutputHelper testOutputHelper, bool startSuspended, Stream input, Stream output, IDisposable debugAdapterDisposable)
@@ -55,6 +86,12 @@ public static partial class TestHelper
 	{
 		var attachRequest = DebugAdapterProcessHelper.GetAttachRequest(debuggableProcessId, justMyCode);
 		debugProtocolHost.SendRequestSync(attachRequest);
+		return debugProtocolHost;
+	}
+
+	public static DebugProtocolHost WithLaunchRequest(this DebugProtocolHost debugProtocolHost, string program, bool stopAtEntry, bool justMyCode)
+	{
+		debugProtocolHost.SendRequestSync(DebugAdapterProcessHelper.GetLaunchRequest(program, stopAtEntry, justMyCode));
 		return debugProtocolHost;
 	}
 	public static async Task<DebugProtocolHost> WaitForInitializedEvent(this DebugProtocolHost debugProtocolHost, TaskCompletionSource initializedEventTcs)
@@ -132,6 +169,14 @@ public static partial class TestHelper
 		// DiagnosticsClient.ResumeRuntime seems to have a different implementation on MacOS - it will throw if the runtime is not paused...
 		if (startSuspended) new DiagnosticsClient(processId).ResumeRuntime();
 		return debugProtocolHost;
+	}
+
+	public static StackFrame GetTopStackFrame(this DebugProtocolHost debugProtocolHost, int threadId)
+	{
+		var stackTraceRequest = new StackTraceRequest { ThreadId = threadId, StartFrame = 0, Levels = 1 };
+		var stackTraceResponse = debugProtocolHost.SendRequestSync(stackTraceRequest);
+		var topFrame = stackTraceResponse.StackFrames.Single();
+		return topFrame;
 	}
 
 	public static DebugProtocolHost WithStackTraceRequest(this DebugProtocolHost debugProtocolHost, int threadId, out StackTraceResponse stackTraceResponse, int? levels = 1)

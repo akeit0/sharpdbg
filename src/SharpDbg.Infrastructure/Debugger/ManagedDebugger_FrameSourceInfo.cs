@@ -1,20 +1,16 @@
-using System.Reflection.Metadata;
-using System.Reflection.Metadata.Ecma335;
 using System.Reflection.PortableExecutable;
-using System.Text;
-using ClrDebug;
+using ICorDebugSharp;
 using ICSharpCode.Decompiler;
 using ICSharpCode.Decompiler.CSharp;
 using ICSharpCode.Decompiler.CSharp.Transforms;
 using ICSharpCode.Decompiler.DebugInfo;
-using ICSharpCode.Decompiler.Disassembler;
 using ICSharpCode.Decompiler.Metadata;
 using ICSharpCode.Decompiler.TypeSystem;
 using SharpDbg.Infrastructure.Debugger.Decompilation;
 
 namespace SharpDbg.Infrastructure.Debugger;
 
-public readonly record struct SourceInfo(string FilePath, int StartLine, int StartColumn, DecompiledSourceInfo? DecompiledSourceInfo);
+public readonly record struct SourceInfo(string FilePath, int StartLine, int EndLine, int StartColumn, int EndColumn, DecompiledSourceInfo? DecompiledSourceInfo);
 public class DecompiledSourceInfo
 {
 	public required string TypeFullName { get; init; }
@@ -25,100 +21,101 @@ public record struct AssemblyPathAndMvid(string AssemblyPath, Guid Mvid);
 public partial class ManagedDebugger
 {
 	/// This appears to be 1 based, ie requires no adjustment when returned to the user
-	private SourceInfo? GetSourceInfoAtFrame(CorDebugFrame frame)
+	private SourceInfo? GetSourceInfoAtFrame(ICorDebugFrame frame, bool decompileIfNeeded)
 	{
-		if (frame is not CorDebugILFrame ilFrame)
+		if (frame is not ICorDebugILFrame ilFrame)
 			throw new InvalidOperationException("Active frame is not an IL frame");
 		var function = ilFrame.Function;
 		var module = _modules[function.Module.BaseAddress];
-		if (module.SymbolReader is null && _justMyCode is false)
+		if (module.MetadataReader.HasSymbols is false && decompileIfNeeded)
 		{
-			if (module.IsUserCode) throw new InvalidOperationException("The module we are decompiling is user code - this should never happen, we should only be decompiling non user code modules");
 			// No PDB on disk — generate one via decompilation and update the module entry
-			var result = GetCachedOrGeneratePdb(module);
-			if (result is not null)
+			if (GetCachedOrGeneratePdb(module))
 			{
-				module.SymbolReader = result;
-				module.SymbolReaderFromDecompiled = true;
+				module.SymbolsFromDecompiled = true;
 			}
 		}
 
-		if (module.SymbolReader is not null)
+		if (module.MetadataReader.HasSymbols)
 		{
 			var ilOffset = ilFrame.IP.pnOffset;
 			var methodToken = function.Token;
-			var sourceInfo = module.SymbolReader.GetSourceLocationForOffset(methodToken, ilOffset);
+			var sourceInfo = module.MetadataReader.GetSourceLocationForOffset(methodToken, ilOffset);
 			if (sourceInfo is not null)
 			{
 				DecompiledSourceInfo? decompiledSourceInfo = null;
-				if (module.SymbolReaderFromDecompiled)
+				if (module.SymbolsFromDecompiled)
 				{
-					var metadataImport = module.Module.GetMetaDataInterface().MetaDataImport;
-					var mvid = metadataImport.ScopeProps.pmvid;
-					var containingTypeDef = metadataImport.GetMethodProps(methodToken).pClass;
-					var typeProps = metadataImport.GetTypeDefProps(containingTypeDef);
-					var typeName = typeProps.szTypeDef;
-
-					string? callingUserCodeAssemblyPath = null;
-					var caller = frame.Caller;
-					while (callingUserCodeAssemblyPath is null)
-					{
-						if (caller is null) break;
-
-						if (caller is CorDebugILFrame callerIlFrame)
-						{
-							var callerFunction = callerIlFrame.Function;
-							var callerModule = _modules[callerFunction.Module.BaseAddress];
-							if (callerModule.IsUserCode)
-							{
-								callingUserCodeAssemblyPath = callerModule.ModulePath;
-								break;
-							}
-						}
-
-						caller = caller.Caller;
-					}
-
-					decompiledSourceInfo = new DecompiledSourceInfo
-					{
-						TypeFullName = typeName,
-						Assembly = new AssemblyPathAndMvid(module.ModulePath, mvid),
-						CallingUserCodeAssemblyPath = callingUserCodeAssemblyPath ?? throw new InvalidOperationException("Could not find a user code caller in the call stack")
-					};
+					var callingUserCodeAssemblyPath = FindCallingUserCodeAssemblyPath(frame.Caller);
+					decompiledSourceInfo = CreateDecompiledSourceInfo(module, methodToken, callingUserCodeAssemblyPath);
 				}
 
-				return new SourceInfo(sourceInfo.Value.sourceFilePath, sourceInfo.Value.startLine, sourceInfo.Value.startColumn, decompiledSourceInfo);
+				return new SourceInfo(sourceInfo.Value.sourceFilePath, sourceInfo.Value.startLine, sourceInfo.Value.endLine, sourceInfo.Value.startColumn, sourceInfo.Value.endColumn, decompiledSourceInfo);
 			}
 		}
 
 		return null;
 	}
 
-	private SymbolReader? GetCachedOrGeneratePdb(ModuleInfo moduleInfo)
+	/// Walks the physical caller chain looking for the closest frame from a user code assembly
+	private string? FindCallingUserCodeAssemblyPath(ICorDebugFrame? startFrame)
+	{
+		for (var frame = startFrame; frame is not null; frame = frame.Caller)
+		{
+			if (frame is not ICorDebugILFrame ilFrame) continue;
+			var callerModule = _modules[ilFrame.Function.Module.BaseAddress];
+			if (callerModule.IsUserCode) return callerModule.ModulePath;
+		}
+		return null;
+	}
+
+	private static DecompiledSourceInfo? CreateDecompiledSourceInfo(ModuleInfo module, int methodToken, string? callingUserCodeAssemblyPath)
+	{
+		if (callingUserCodeAssemblyPath is null) return null;
+		var metadataImport = module.Module.GetMetaDataInterface<IMetaDataImport>();
+		var mvid = metadataImport.ScopeProps.pmvid;
+		var containingTypeDef = metadataImport.GetMethodProps(methodToken).pClass;
+		return new DecompiledSourceInfo
+		{
+			TypeFullName = GetFullMetadataTypeName(metadataImport, containingTypeDef),
+			Assembly = new AssemblyPathAndMvid(module.ModulePath, mvid),
+			CallingUserCodeAssemblyPath = callingUserCodeAssemblyPath
+		};
+	}
+
+	private static string GetFullMetadataTypeName(IMetaDataImport metadataImport, mdTypeDef typeDef)
+	{
+		var typeProps = metadataImport.GetTypeDefProps(typeDef);
+		if (typeProps.pdwTypeDefFlags.IsTdNested() is false) return typeProps.szTypeDef;
+
+		var declaringType = metadataImport.GetNestedClassProps(typeDef);
+		return $"{GetFullMetadataTypeName(metadataImport, declaringType)}+{typeProps.szTypeDef}";
+	}
+
+	private bool GetCachedOrGeneratePdb(ModuleInfo moduleInfo)
 	{
 		var sharpIdeSymbolCachePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Temp", "SharpIdeSymbolCache");
-		var metadataImport = moduleInfo.Module.GetMetaDataInterface().MetaDataImport;
+		var metadataImport = moduleInfo.Module.GetMetaDataInterface<IMetaDataImport>();
 		var mvid = metadataImport.ScopeProps.pmvid;
 		var assemblyName = Path.GetFileNameWithoutExtension(moduleInfo.ModuleName);
 		var pdbPath = Path.Combine(sharpIdeSymbolCachePath, assemblyName, mvid.ToString(), $"{assemblyName}.decompiled.pdb");
 		if (File.Exists(pdbPath))
 		{
-			var symbolReader = SymbolReader.TryLoadWithPdbPath(moduleInfo.ModulePath, pdbPath);
-			if (symbolReader is null)
+			if (!moduleInfo.MetadataReader.TryLoadSymbols(pdbPath))
 			{
-				_logger?.Invoke($"GetCachedOrGeneratePdb: SymbolReader could not load cached PDB '{pdbPath}'");
-				return null;
+				_logger?.Invoke($"GetCachedOrGeneratePdb: could not load cached PDB '{pdbPath}'");
+				return false;
 			}
-			return symbolReader;
+			return true;
 		}
 		return GeneratePdb(moduleInfo, pdbPath);
 	}
 
 
-	private SymbolReader? GeneratePdb(ModuleInfo moduleInfo, string pdbPathToWriteTo)
+	private bool GeneratePdb(ModuleInfo moduleInfo, string pdbPathToWriteTo)
 	{
 		var assemblyPath = moduleInfo.ModulePath;
-		if (!File.Exists(assemblyPath)) return null;
+		if (!File.Exists(assemblyPath)) return false;
 
 		var allModulePaths = _modules.Values.Select(m => m.ModulePath).Where(p => !string.IsNullOrEmpty(p)).ToList();
 		var resolver = new DebuggingAssemblyResolver(allModulePaths);
@@ -131,7 +128,7 @@ public partial class ManagedDebugger
 		catch (Exception ex)
 		{
 			_logger?.Invoke($"GeneratePdb: failed to open PE file '{assemblyPath}': {ex.Message}");
-			return null;
+			return false;
 		}
 
 		using (file)
@@ -145,119 +142,24 @@ public partial class ManagedDebugger
 				var pdbDirectory = Path.GetDirectoryName(pdbPathToWriteTo)!;
 				if (!Directory.Exists(pdbDirectory)) Directory.CreateDirectory(pdbDirectory);
 				using var pdbStream = File.Create(pdbPathToWriteTo);
-				PortablePdbWriter2.WritePdb(file, decompilerTypeSystem, decompilerSettings, pdbStream, noLogo: true);
+				var portablePdbWriter2 = new PortablePdbWriter2 { NoLogo = true };
+				portablePdbWriter2.WritePdb(file, decompilerTypeSystem, decompilerSettings, pdbStream);
 			}
 			catch (Exception ex)
 			{
 				_logger?.Invoke($"GeneratePdb: exception writing PDB: {ex}");
 				File.Delete(pdbPathToWriteTo);
-				return null;
+				return false;
 			}
 
-			var symbolReader = SymbolReader.TryLoadWithPdbPath(assemblyPath, pdbPathToWriteTo);
-			if (symbolReader is null)
+			if (!moduleInfo.MetadataReader.TryLoadSymbols(pdbPathToWriteTo))
 			{
-				_logger?.Invoke($"GeneratePdb: SymbolReader could not load generated PDB '{pdbPathToWriteTo}'");
-				return null;
+				_logger?.Invoke($"GeneratePdb: could not load generated PDB '{pdbPathToWriteTo}'");
+				return false;
 			}
 
 			_logger?.Invoke($"GeneratePdb: successfully loaded generated PDB for '{Path.GetFileName(assemblyPath)}'");
-			return symbolReader;
-		}
-	}
-
-	/// <summary>
-	/// Decompile the method in the given stack frame to C# source or IL.
-	/// </summary>
-	public string? DecompileFrame(int frameId, bool ilMode = false)
-	{
-		var frameInfo = _frameReferenceManager.GetFrameInfoById(frameId);
-		if (frameInfo is null)
-			return null;
-
-		try
-		{
-			var ilFrame = GetFrameForThreadIdAndStackDepth(frameInfo.Value.threadId, frameInfo.Value.frameStackDepth);
-			var function = ilFrame.Function;
-			var module = _modules[function.Module.BaseAddress];
-			var methodToken = function.Token;
-			var assemblyPath = module.ModulePath;
-
-			if (string.IsNullOrEmpty(assemblyPath) || !File.Exists(assemblyPath))
-				return null;
-
-			return ilMode
-				? DecompileMethodToIl(assemblyPath, methodToken)
-				: DecompileMethod(assemblyPath, methodToken);
-		}
-		catch (Exception ex)
-		{
-			_logger?.Invoke($"DecompileFrame failed: {ex.Message}");
-			return null;
-		}
-	}
-
-	private string? DecompileMethod(string assemblyPath, int methodToken)
-	{
-		var allModulePaths = _modules.Values.Select(m => m.ModulePath).Where(p => !string.IsNullOrEmpty(p)).ToList();
-		var resolver = new DebuggingAssemblyResolver(allModulePaths);
-
-		PEFile file;
-		try
-		{
-			file = new PEFile(assemblyPath, PEStreamOptions.PrefetchEntireImage);
-		}
-		catch (Exception ex)
-		{
-			_logger?.Invoke($"DecompileMethod: failed to open PE file '{assemblyPath}': {ex.Message}");
-			return null;
-		}
-
-		using (file)
-		{
-			var decompilerSettings = new DecompilerSettings();
-			var decompilerTypeSystem = new DecompilerTypeSystem(file, resolver, decompilerSettings);
-			var decompiler = new CSharpDecompiler(decompilerTypeSystem, decompilerSettings);
-			var methodHandle = MetadataTokens.MethodDefinitionHandle(methodToken);
-			var syntaxTree = decompiler.Decompile(methodHandle);
-			return PortablePdbWriter2.SyntaxTreeToString(syntaxTree, decompilerSettings);
-		}
-	}
-
-	private string? DecompileMethodToIl(string assemblyPath, int methodToken)
-	{
-		PEFile file;
-		try
-		{
-			file = new PEFile(assemblyPath, PEStreamOptions.PrefetchEntireImage);
-		}
-		catch (Exception ex)
-		{
-			_logger?.Invoke($"DecompileMethodToIl: failed to open PE file '{assemblyPath}': {ex.Message}");
-			return null;
-		}
-
-		using (file)
-		{
-			try
-			{
-				var sb = new StringBuilder();
-				using var writer = new StringWriter(sb);
-				var output = new PlainTextOutput(writer) { IndentationString = "  " };
-				var disassembler = new ReflectionDisassembler(output, CancellationToken.None)
-				{
-					ShowSequencePoints = false,
-					ShowRawRVAOffsetAndBytes = false,
-				};
-				var methodHandle = MetadataTokens.MethodDefinitionHandle(methodToken);
-				disassembler.DisassembleMethod(file, methodHandle);
-				return sb.ToString();
-			}
-			catch (Exception ex)
-			{
-				_logger?.Invoke($"DecompileMethodToIl: failed to disassemble method 0x{methodToken:X}: {ex.Message}");
-				return null;
-			}
+			return true;
 		}
 	}
 }

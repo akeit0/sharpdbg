@@ -1,12 +1,16 @@
-using ClrDebug;
+using ICorDebugSharp;
 
 namespace SharpDbg.Infrastructure.Debugger;
 
 public enum StoredReferenceKind
 {
 	Scope,
+	SyntheticAsyncScope,
 	StackVariable,
 	StaticClassVariable, // This reference was stored as a pseudo variable for the static members of a "StackVariable" class
+	RawView,
+	EnumerableResults,
+	ArrayRange,
 }
 
 public readonly record struct ThreadId
@@ -29,7 +33,7 @@ public readonly record struct FrameStackDepth
 		Value = value;
 	}
 };
-public record struct VariablesReference(StoredReferenceKind ReferenceKind, CorDebugValue? ObjectValue, ThreadId ThreadId, FrameStackDepth FrameStackDepth, CorDebugValue? DebuggerProxyInstance);
+public record struct VariablesReference(StoredReferenceKind ReferenceKind, ICorDebugValue? ObjectValue, ThreadId ThreadId, FrameStackDepth FrameStackDepth, ICorDebugValue? DebuggerProxyInstance, uint[]? ArrayIndices = null, uint? ArrayStartOffset = null, uint? ArrayCount = null);
 /// <summary>
 /// Manages variable references for scopes and variables
 /// </summary>
@@ -74,7 +78,9 @@ public class VariableManager
 	{
 		lock (_lock)
 		{
-			var handleReferences = _references.Values.SelectMany(GetHandleValues).ToList();
+			// Distinct because if an ICorDebugHandleValue (result of property or eval) has static members, we store the same ICorDebugHandleValue as a 'Static Members' alias variable.
+			// Meaning that without distinct, we would attempt to dispose the same ICorDebugHandleValue twice.
+			var handleReferences = _references.Values.SelectMany(GetHandleValues).Distinct().ToList();
 			handleReferences.ForEach(h => h.Dispose());
 			_references.Clear();
 			_nextReference = 1;
@@ -85,19 +91,21 @@ public class VariableManager
 	{
 		lock (_lock)
 		{
-			var handleReferences = _references.Values.SelectMany(GetHandleValues).ToList();
+			// Distinct because if an ICorDebugHandleValue (result of property or eval) has static members, we store the same ICorDebugHandleValue as a 'Static Members' alias variable.
+			// Meaning that without distinct, we would attempt to dispose the same ICorDebugHandleValue twice.
+			var handleReferences = _references.Values.SelectMany(GetHandleValues).Distinct().ToList();
 			handleReferences.ForEach(h => h.TryDispose());
 			_references.Clear();
 			_nextReference = 1;
 		}
 	}
 
-	private static IEnumerable<CorDebugHandleValue> GetHandleValues(VariablesReference r)
+	private static IEnumerable<ICorDebugHandleValue> GetHandleValues(VariablesReference r)
 	{
-		if (r.ObjectValue is CorDebugHandleValue ov)
+		if (r.ObjectValue is ICorDebugHandleValue ov)
 			yield return ov;
 
-		if (r.DebuggerProxyInstance is CorDebugHandleValue dp)
+		if (r.DebuggerProxyInstance is ICorDebugHandleValue dp)
 			yield return dp;
 	}
 }

@@ -1,28 +1,38 @@
 using System.Runtime.InteropServices;
-using ClrDebug;
+using ICorDebugSharp;
 
 namespace SharpDbg.Infrastructure.Debugger;
 
 public static class CorDebugValueExtensions
 {
-	public static CorDebugObjectValue UnwrapDebugValueToObject(this CorDebugValue corDebugValue)
+	public static ICorDebugObjectValue UnwrapDebugValueToObject(this ICorDebugValue corDebugValue)
 	{
 		var unwrappedValue = corDebugValue.UnwrapDebugValue();
-		if (unwrappedValue is CorDebugObjectValue objectValue)
+		if (unwrappedValue is ICorDebugObjectValue objectValue)
 		{
 			return objectValue;
 		}
 		throw new InvalidOperationException("CorDebugValue is not an CorDebugObjectValue");
 	}
 
-	public static CorDebugValue UnwrapDebugValue(this CorDebugValue corDebugValue)
+	public static ICorDebugObjectValue? UnwrapDebugValueToObjectOrNull(this ICorDebugValue corDebugValue)
+	{
+		var unwrappedValue = corDebugValue.UnwrapDebugValue();
+		if (unwrappedValue is ICorDebugObjectValue objectValue)
+		{
+			return objectValue;
+		}
+		return null;
+	}
+
+	public static ICorDebugValue UnwrapDebugValue(this ICorDebugValue corDebugValue)
 	{
 		var valueToCheck = corDebugValue;
-		if (valueToCheck is CorDebugReferenceValue { IsNull: false } refValue)
+		if (valueToCheck is ICorDebugReferenceValue { IsNull: false } refValue)
 		{
 			valueToCheck = refValue.Dereference();
 		}
-		if (valueToCheck is CorDebugBoxValue boxValue)
+		if (valueToCheck is ICorDebugBoxValue boxValue)
 		{
 			valueToCheck = boxValue.Object;
 		}
@@ -30,30 +40,7 @@ public static class CorDebugValueExtensions
 		return valueToCheck;
 	}
 
-	/// <summary>
-	/// Use this until https://github.com/lordmilko/ClrDebug/pull/20 is resolved
-	/// </summary>
-	public static string GetStringWithoutBug(this CorDebugStringValue corDebugStringValue, int cchString)
-	{
-		TryGetString(corDebugStringValue, cchString, out var szStringResult).ThrowOnNotOK();
-		return szStringResult!;
-	}
-
-	private static HRESULT TryGetString(CorDebugStringValue corDebugStringValue, int cchString, out string? szStringResult)
-	{
-		char[] chArray = new char[cchString];
-		int pcchString;
-		int num = (int)corDebugStringValue.Raw.GetString(cchString, out pcchString, chArray);
-		if (num == 0)
-		{
-			szStringResult = ClrDebug.Extensions.CreateString(chArray, pcchString + 1);
-			return (HRESULT)num;
-		}
-		szStringResult = null;
-		return (HRESULT)num;
-	}
-
-	public static byte[] GetValueAsBytes(this CorDebugGenericValue corDebugGenericValue)
+	public static byte[] GetValueAsBytes(this ICorDebugGenericValue corDebugGenericValue)
 	{
 		IntPtr buffer = Marshal.AllocHGlobal(corDebugGenericValue.Size);
 		try
@@ -69,18 +56,18 @@ public static class CorDebugValueExtensions
 		}
 	}
 
-	public static CorDebugValue? GetClassFieldValue(this CorDebugObjectValue objectValue, CorDebugILFrame ilFrame, string fieldName)
+	public static ICorDebugValue? GetClassFieldValue(this ICorDebugObjectValue objectValue, ICorDebugILFrame ilFrame, string fieldName)
 	{
-		CorDebugType? currentType = objectValue.ExactType;
+		ICorDebugType? currentType = objectValue.ExactType;
 		mdFieldDef foundFieldDef = default;
-		CorDebugClass? foundClass = null;
-		MetaDataImport? foundMetadata = null;
+		ICorDebugClass? foundClass = null;
+		IMetaDataImport? foundMetadata = null;
 
 		// Find field on base type if necessary
 		while (currentType is not null)
 		{
 			var cls = currentType.Class;
-			var meta = cls.Module.GetMetaDataInterface().MetaDataImport;
+			var meta = cls.Module.GetMetaDataInterface<IMetaDataImport>();
 			var field = meta.EnumFieldsWithName(cls.Token, fieldName).SingleOrDefault();
 			if (field.IsNil is false)
 			{
@@ -92,40 +79,45 @@ public static class CorDebugValueExtensions
 			currentType = currentType.Base;
 		}
 
-		if (foundClass is null || foundMetadata is null || foundFieldDef.IsNil) return null;
+		if (foundClass is null || foundMetadata is null || currentType is null || foundFieldDef.IsNil) return null;
 
 		var isStatic = foundFieldDef.IsStatic(foundMetadata);
 		var isLiteral = foundFieldDef.IsLiteral(foundMetadata);
-		var fieldCorDebugValue = isLiteral ? foundFieldDef.GetLiteralCorDebugValue(foundMetadata, ilFrame) : isStatic ? foundClass.GetStaticFieldValue(foundFieldDef, ilFrame.Raw) : objectValue.GetFieldValue(foundClass.Raw, foundFieldDef);
+		var fieldCorDebugValue = isLiteral ? foundFieldDef.GetLiteralCorDebugValue(foundMetadata, ilFrame) : isStatic ? currentType.GetStaticFieldValue(foundFieldDef, ilFrame) : objectValue.GetFieldValue(foundClass, foundFieldDef);
 		return fieldCorDebugValue;
 	}
 
-	public static CorDebugGenericValue GetLiteralCorDebugValue(this mdFieldDef fieldDef, MetaDataImport metadataImport, CorDebugILFrame ilFrame)
+	public static ICorDebugGenericValue GetLiteralCorDebugValue(this mdFieldDef fieldDef, IMetaDataImport metadataImport, ICorDebugILFrame ilFrame)
 	{
 		var fieldProps = metadataImport.GetFieldProps(fieldDef);
 		var ppValue = fieldProps.ppValue;
 		var corElementType = fieldProps.pdwCPlusTypeFlag;
 		var eval = ilFrame.Chain.Thread.CreateEval();
 		var createdValue = eval.CreateValue(corElementType, null);
-		if (createdValue is not CorDebugGenericValue corDebugGenericValue) throw new InvalidOperationException("Expected a CorDebugGenericValue for literal value");
+		if (createdValue is not ICorDebugGenericValue corDebugGenericValue) throw new InvalidOperationException("Expected a CorDebugGenericValue for literal value");
 		corDebugGenericValue.SetValue(ppValue);
 		return corDebugGenericValue;
 	}
 
-	public static async Task<CorDebugValue?> GetPropertyValue(this CorDebugValue objectValue, CorDebugManagedCallback callback, EvalStatus evalStatus, CorDebugILFrame ilFrame, string propertyName)
+	public static async Task<ICorDebugValue?> GetPropertyValue(this ICorDebugValue objectValue, Func<Task<CorDebugManagedCallbackEventArgs>> processEventsUntilEvalEventFunc, EvalStatus evalStatus, ICorDebugILFrame ilFrame, string propertyName)
+	{
+		return (await GetPropertyValueWithSetter(objectValue, processEventsUntilEvalEventFunc, evalStatus, ilFrame, propertyName))?.Value;
+	}
+
+	public static async Task<(ICorDebugValue Value, ICorDebugFunction? SetterFunction)?> GetPropertyValueWithSetter(this ICorDebugValue objectValue, Func<Task<CorDebugManagedCallbackEventArgs>> processEventsUntilEvalEventFunc, EvalStatus evalStatus, ICorDebugILFrame ilFrame, string propertyName)
 	{
 		var unwrappedValue = objectValue.UnwrapDebugValueToObject();
 
-		CorDebugType? currentType = unwrappedValue.ExactType;
+		ICorDebugType? currentType = unwrappedValue.ExactType;
 		mdProperty foundPropertyDef = default;
-		CorDebugClass? foundClass = null;
-		MetaDataImport? foundMetadata = null;
+		ICorDebugClass? foundClass = null;
+		IMetaDataImport? foundMetadata = null;
 
 		// Find property on base type if necessary
 		while (currentType is not null)
 		{
 			var cls = currentType.Class;
-			var meta = cls.Module.GetMetaDataInterface().MetaDataImport;
+			var meta = cls.Module.GetMetaDataInterface<IMetaDataImport>();
 			var prop = meta.GetPropertyWithName(cls.Token, propertyName);
 			if (prop?.IsNil is false)
 			{
@@ -151,27 +143,28 @@ public static class CorDebugValueExtensions
 		var isStatic = getterAttr.IsMdStatic();
 
 		var getMethod = foundClass.Module.GetFunctionFromToken(getMethodDef);
+		var setMethodDef = propertyProps.pmdSetter;
+		var setterFunction = setMethodDef == mdMethodDef.Nil ? null : foundClass.Module.GetFunctionFromToken(setMethodDef);
 		var eval = ilFrame.Chain.Thread.CreateEval();
 
 		// May not be correct, will need further testing
 		var parameterizedContainingType = objectValue.ExactType;
 
 		var typeParameterTypes = parameterizedContainingType.TypeParameters;
-		var typeParameterArgs = typeParameterTypes.Select(t => t.Raw).ToArray();
 
 		// For instance properties, pass the object; for static, pass nothing. Must pass the original CorDebugReferenceValue, not the dereferenced one.
-		ICorDebugValue[] corDebugValues = isStatic ? [] : [objectValue!.Raw];
+		ICorDebugValue[] corDebugValues = isStatic ? [] : [objectValue];
 
-		var returnValue = await eval.CallParameterizedFunctionAsync(callback, evalStatus, getMethod, typeParameterTypes.Length, typeParameterArgs, corDebugValues.Length, corDebugValues);
-		return returnValue;
+		var returnValue = await eval.CallParameterizedFunctionAsync(processEventsUntilEvalEventFunc, evalStatus, getMethod, typeParameterTypes.Length, typeParameterTypes, corDebugValues.Length, corDebugValues);
+		return returnValue is null ? null : (returnValue, setterFunction);
 	}
 
-	public static CorDebugFunction? GetPropertySetter(this CorDebugObjectValue objectValue, string propertyName)
+	public static ICorDebugFunction? GetPropertySetter(this ICorDebugObjectValue objectValue, string propertyName)
 	{
 		return null;
 	}
 
-	public static bool IsExceptionType(this CorDebugType corDebugType)
+	public static bool IsExceptionType(this ICorDebugType corDebugType)
 	{
 		var type = corDebugType;
 		while (type is not null)
@@ -180,5 +173,44 @@ public static class CorDebugValueExtensions
 			type = type.Base;
 		}
 		return false;
+	}
+
+	public static string GetThreadName(this ICorDebugThread thread) => thread.GetThreadNameOrNull() ?? "<No Name>";
+	public static string? GetThreadNameOrNull(this ICorDebugThread thread)
+	{
+		// GetObject fails with CORDBG_E_BAD_THREAD_STATE while a thread has no managed Thread object yet
+		if (thread.TryGetObject(out var threadObjectValue) is not Cor.S_OK) return null;
+		if (threadObjectValue.UnwrapDebugValue() is not ICorDebugObjectValue threadObject) return null;
+
+		var corClass = threadObject.Class;
+		var metadataImport = corClass.Module.GetMetaDataInterface<IMetaDataImport>();
+
+		var name = GetThreadNameField(threadObject, corClass, metadataImport);
+		if (string.IsNullOrEmpty(name) is false) return name;
+
+		var managedThreadId = GetManagedThreadIdField(threadObject, corClass, metadataImport);
+		if (managedThreadId is 1) return "Main Thread";
+
+		return null;
+	}
+
+	private static string? GetThreadNameField(ICorDebugObjectValue threadObject, ICorDebugClass corClass, IMetaDataImport metadataImport)
+	{
+		var fieldDef = metadataImport.EnumFieldsWithName(corClass.Token, "_name").SingleOrDefault();
+		if (fieldDef.IsNil) return null;
+
+		var fieldValue = threadObject.GetFieldValue(corClass, fieldDef);
+		if (fieldValue?.UnwrapDebugValue() is not ICorDebugStringValue stringValue) return null;
+		return stringValue.String;
+	}
+
+	private static int? GetManagedThreadIdField(ICorDebugObjectValue threadObject, ICorDebugClass corClass, IMetaDataImport metadataImport)
+	{
+		var fieldDef = metadataImport.EnumFieldsWithName(corClass.Token, "_managedThreadId").SingleOrDefault();
+		if (fieldDef.IsNil) return null;
+
+		var fieldValue = threadObject.GetFieldValue(corClass, fieldDef);
+		if (fieldValue?.UnwrapDebugValue() is not ICorDebugGenericValue genericValue) return null;
+		return BitConverter.ToInt32(genericValue.GetValueAsBytes(), 0);
 	}
 }

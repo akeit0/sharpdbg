@@ -10,7 +10,7 @@ public class LambdaVariablesTests(ITestOutputHelper testOutputHelper)
 	public async Task SharpDbgCli_InLambda_VariablesRequest_Returns_InScopeVariables()
 	{
 		var startSuspended = true;
-		var (debugProtocolHost, initializedEventTcs, debugEventTcs, adapter, p2) = TestHelper.GetRunningDebugProtocolHostInProc(testOutputHelper, startSuspended);
+		var (debugProtocolHost, initializedEventTcs, debugEventTcs, adapter, p2) = TestHelper.GetRunningDebugProtocolHost(testOutputHelper, startSuspended);
 		using var _ = adapter;
 		using var __ = new ProcessKiller(p2);
 		using var ___ = debugProtocolHost;
@@ -40,11 +40,11 @@ public class LambdaVariablesTests(ITestOutputHelper testOutputHelper)
 		List<Variable> expectedVariables =
 		[
 			new() {Name = "this", Value = "{DebuggableConsoleApp.Lambdas.MyLambdaClass}", Type = "DebuggableConsoleApp.Lambdas.MyLambdaClass", EvaluateName = "this", VariablesReference = 2 },
-			new() {Name = "capturedString",  EvaluateName = "capturedString",  Value = "captured", Type = "string" },
+			new() {Name = "capturedString",  EvaluateName = "capturedString",  Value = "\"captured\"", Type = "string" },
 			new() {Name = "innerLocalFromOuterLocalInt1",  EvaluateName = "innerLocalFromOuterLocalInt1",  Value = "4",  Type = "int" },
 			new() {Name = "innerLocalFromOuterLocalInt2",  EvaluateName = "innerLocalFromOuterLocalInt2",  Value = "15",  Type = "int" },
 			new() {Name = "innerLocalFromRootLocalInt",  EvaluateName = "innerLocalFromRootLocalInt",  Value = "10",  Type = "int" },
-			new() {Name = "innerLocalFromRootLocalString", EvaluateName = "innerLocalFromRootLocalString", Value = "captured",  Type = "string" },
+			new() {Name = "innerLocalFromRootLocalString", EvaluateName = "innerLocalFromRootLocalString", Value = "\"captured\"",  Type = "string" },
 			new() {Name = "local",  EvaluateName = "local",  Value = "10",  Type = "int" },
 			new() {Name = "outerLocalFromCapturedField",  EvaluateName = "outerLocalFromCapturedField",  Value = "4",  Type = "int" },
 			new() {Name = "outerLocalFromLocal",  EvaluateName = "outerLocalFromLocal",  Value = "15",  Type = "int" },
@@ -56,6 +56,6 @@ public class LambdaVariablesTests(ITestOutputHelper testOutputHelper)
 		debugProtocolHost.WithVariablesRequest(scope.VariablesReference, out var variables);
 
 		variables.Should().HaveCount(11);
-		variables.Should().BeEquivalentTo(expectedVariables);
+		variables.ShouldBeEquivalentToDebuggerVariables(expectedVariables);
 	}
 }

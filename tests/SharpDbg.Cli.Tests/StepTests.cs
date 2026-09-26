@@ -10,7 +10,7 @@ public class StepTests(ITestOutputHelper testOutputHelper)
 	{
 		var startSuspended = true;
 
-		var (debugProtocolHost, initializedEventTcs, debugEventTcs, adapter, p2) = TestHelper.GetRunningDebugProtocolHostInProc(testOutputHelper, startSuspended);
+		var (debugProtocolHost, initializedEventTcs, debugEventTcs, adapter, p2) = TestHelper.GetRunningDebugProtocolHost(testOutputHelper, startSuspended);
 		using var _ = adapter;
 		using var __ = new ProcessKiller(p2);
 		using var ___ = debugProtocolHost;
@@ -69,17 +69,17 @@ public class StepTests(ITestOutputHelper testOutputHelper)
 		stopInfo7.line.Should().Be(20);
 
 		// breakpoint on a line that would F11 into unmapped code
-		debugProtocolHost.WithBreakpointsRequest(10, Path.JoinFromGitRoot("tests", "DebuggableConsoleApp", "Namespace1", "AnotherClass.cs"));
+		debugProtocolHost.WithBreakpointsRequest(13, Path.JoinFromGitRoot("tests", "DebuggableConsoleApp", "Namespace1", "AnotherClass.cs"));
 		var stoppedEvent8 = await debugProtocolHost.WithContinueRequest().WaitForStoppedEvent(debugEventTcs);
 		var stopInfo8 = stoppedEvent8.ReadStopInfo();
 		stopInfo8.filePath.Should().EndWith("AnotherClass.cs");
-		stopInfo8.line.Should().Be(10);
+		stopInfo8.line.Should().Be(13);
 
-		// ensure that we do not receive stop info with no source
+		// ensure that we do not receive stop info with no source. StepIn with JMC false, landing in non-user code, continues and stops at the next user code
 		var stoppedEvent9 = await debugProtocolHost.WithStepInRequest(stoppedEvent.ThreadId!.Value).WaitForStoppedEvent(debugEventTcs);
 		var stopInfo9 = stoppedEvent9.ReadStopInfo();
 		stopInfo9.filePath.Should().EndWith("AnotherClass.cs");
-		stopInfo9.line.Should().Be(10);
+		stopInfo9.line.Should().Be(14);
 
 		List<int> threadIds = [stoppedEvent.ThreadId!.Value, stoppedEvent2.ThreadId!.Value, stoppedEvent3.ThreadId!.Value, stoppedEvent4.ThreadId!.Value, stoppedEvent5.ThreadId!.Value, stoppedEvent6.ThreadId!.Value, stoppedEvent7.ThreadId!.Value, stoppedEvent8.ThreadId!.Value, stoppedEvent9.ThreadId!.Value];
 		threadIds.Distinct().Should().HaveCount(1);
@@ -90,7 +90,7 @@ public class StepTests(ITestOutputHelper testOutputHelper)
 	{
 		var startSuspended = true;
 
-		var (debugProtocolHost, initializedEventTcs, debugEventTcs, adapter, p2) = TestHelper.GetRunningDebugProtocolHostInProc(testOutputHelper, startSuspended);
+		var (debugProtocolHost, initializedEventTcs, debugEventTcs, adapter, p2) = TestHelper.GetRunningDebugProtocolHost(testOutputHelper, startSuspended);
 		using var _ = adapter;
 		using var __ = new ProcessKiller(p2);
 		using var ___ = debugProtocolHost;
@@ -112,7 +112,8 @@ public class StepTests(ITestOutputHelper testOutputHelper)
 		var stoppedEvent2 = await debugProtocolHost.WithStepInRequest(stoppedEvent.ThreadId!.Value).WaitForStoppedEvent(debugEventTcs);
 		var stopInfo2 = stoppedEvent2.ReadStopInfo();
 		stopInfo2.filePath.Should().EndWith("Console.cs");
-		stopInfo2.line.Should().Be(807);
+		// Bumping ICSharpCode.Decompiler changed the decompiled output, so the line number changed. If this is failing, clear temp/SharpIdeSymbolCache and try again.
+		stopInfo2.line.Should().Be(1219);
 	}
 
 	[Fact]
@@ -120,7 +121,7 @@ public class StepTests(ITestOutputHelper testOutputHelper)
 	{
 		var startSuspended = true;
 
-		var (debugProtocolHost, initializedEventTcs, debugEventTcs, adapter, p2) = TestHelper.GetRunningDebugProtocolHostInProc(testOutputHelper, startSuspended);
+		var (debugProtocolHost, initializedEventTcs, debugEventTcs, adapter, p2) = TestHelper.GetRunningDebugProtocolHost(testOutputHelper, startSuspended);
 		using var _ = adapter;
 		using var __ = new ProcessKiller(p2);
 		using var ___ = debugProtocolHost;
@@ -151,7 +152,7 @@ public class StepTests(ITestOutputHelper testOutputHelper)
 	{
 		var startSuspended = true;
 
-		var (debugProtocolHost, initializedEventTcs, debugEventTcs, adapter, p2) = TestHelper.GetRunningDebugProtocolHostInProc(testOutputHelper, startSuspended);
+		var (debugProtocolHost, initializedEventTcs, debugEventTcs, adapter, p2) = TestHelper.GetRunningDebugProtocolHost(testOutputHelper, startSuspended);
 		using var _ = adapter;
 		using var __ = new ProcessKiller(p2);
 		using var ___ = debugProtocolHost;

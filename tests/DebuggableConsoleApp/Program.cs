@@ -1,5 +1,5 @@
-
 using DebuggableConsoleApp.Lambdas;
+using DebuggableConsoleApp.Namespace2;
 
 namespace DebuggableConsoleApp;
 
@@ -9,7 +9,7 @@ public static class Program
 	{
 		Console.WriteLine("DebuggableConsoleApp is running");
 		Console.WriteLine("Log2");
-		var myLambdaClass = new MyLambdaClass();
+		var myLambdaClass = new MyLambdaClass();var myClassWithGenericMethod = new MyClassWithGenericMethod();
 		var myClass = new MyClass();
 		var myAsyncClass = new MyAsyncClass();
 		var myAsyncMethodEvalClass = new AsyncMethodEvalClass();
@@ -28,10 +28,18 @@ public static class Program
 			variablesClass.Test();
 			columnBreakpointClass.Test();
 			MultilineSwitchInMethodCall.Test();
-			ClassWithBclCall.Test();
+			ClassWithBclCall.Test(4);
 			var asyncResult = myAsyncClass.MyMethodAsync(4).GetAwaiter().GetResult();
 			myAsyncMethodEvalClass.Test().GetAwaiter().GetResult();
 			Exceptions.Test(exceptionToThrow);
+			MyGenericClassContainingAnotherGenericClass<int, string>.MyNestedGenericClass<double, bool>.Test();
+			SameNamedClass.Test();
+			Namespace3.SameNamedClass.Test();
+			OverloadedMethodsClass.CallAllMethods();
+			MyStaticClass.Test();
+			myLambdaClass.VariableShadowingMethod();
+			myClassWithGenericMethod.Test(4);
+			AsyncStackTraceClass.TestAsync().GetAwaiter().GetResult();
 			Thread.Sleep(100);
 			//await Task.Delay(500);
 		}

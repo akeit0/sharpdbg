@@ -1,6 +1,6 @@
 ﻿namespace SharpDbg.Infrastructure.Debugger;
 
-public class FrameReferenceManager
+public partial class FrameReferenceManager
 {
 	private int _nextFrameId = 1;
 	private readonly Dictionary<int, (ThreadId threadId, FrameStackDepth frameStackDepth)?> _references = [];
@@ -16,6 +16,7 @@ public class FrameReferenceManager
 			{
 				frameId = _nextFrameId++;
 				_references[frameId.Value] = (threadId, frameStackDepth);
+				_referencesByThreadAndFrameStackDepth[(threadId, frameStackDepth)] = frameId;
 			}
 			return frameId.Value;
 		}
@@ -35,6 +36,8 @@ public class FrameReferenceManager
 		{
 			_references.Clear();
 			_referencesByThreadAndFrameStackDepth.Clear();
+			_syntheticAsyncFrameReferences.Clear();
+			_syntheticAsyncFrameReferencesByPhysicalFrame.Clear();
 			_nextFrameId = 1;
 		}
 	}
