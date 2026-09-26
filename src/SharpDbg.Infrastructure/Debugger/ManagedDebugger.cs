@@ -30,6 +30,8 @@ public partial class ManagedDebugger
 	private bool _isRemoteAttach;
 	private int? _pendingAttachProcessId;
 	private int _processId;
+	private Process? _launchedProcess;
+	private bool _keepOutputReaders;
 	private bool _justMyCode;
 	private AsyncStepper? _asyncStepper;
 	private CompiledExpressionInterpreter _expressionInterpreter = null!;
@@ -44,6 +46,7 @@ public partial class ManagedDebugger
 	public event Action<int, string>? OnThreadExited;
 	public event Action<string, string, string>? OnModuleLoaded;
 	public event Action<string>? OnOutput;
+	public event Action<string, string>? OnTargetOutput;
 	public event Action<BreakpointManager.BreakpointInfo>? OnBreakpointChanged;
 	public event Func<LaunchInfo, int> SendRunInTerminalRequest = null!;
 
@@ -114,6 +117,7 @@ public partial class ManagedDebugger
 	private void HandleLogMessage(object? sender, LogMessageCorDebugManagedCallbackEventArgs logMessageEvent)
 	{
 		_logger?.Invoke($"Log: {logMessageEvent.Message}");
+		OnTargetOutput?.Invoke("debug", logMessageEvent.Message.TrimEnd('\r', '\n'));
 		Continue();
 	}
 
@@ -556,6 +560,11 @@ public partial class ManagedDebugger
 
 		// Detach from the process
 		_process?.TryDetach();
+		if (!_keepOutputReaders)
+		{
+			_launchedProcess?.Dispose();
+			_launchedProcess = null;
+		}
 
 		_isAttached = false;
 		_process = null;

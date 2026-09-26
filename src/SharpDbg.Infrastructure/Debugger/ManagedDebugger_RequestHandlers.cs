@@ -61,8 +61,8 @@ public partial class ManagedDebugger
 			WorkingDirectory = launchInfo.Cwd ?? Environment.CurrentDirectory,
 			UseShellExecute = false,
 			CreateNoWindow = true,
-			RedirectStandardOutput = false,
-			RedirectStandardError = false,
+			RedirectStandardOutput = true,
+			RedirectStandardError = true,
 			RedirectStandardInput = false,
 		};
 		foreach (var arg in launchInfo.Arguments)
@@ -76,8 +76,26 @@ public partial class ManagedDebugger
 		}
 		processStartInfo.Environment["DOTNET_DefaultDiagnosticPortSuspend"] = "1";
 
-		using var process = Process.Start(processStartInfo);
+		var process = Process.Start(processStartInfo);
 		if (process is null) throw new InvalidOperationException("Process start failed");
+		_launchedProcess = process;
+		process.EnableRaisingEvents = true;
+		process.Exited += (_, _) =>
+		{
+			try { process.WaitForExit(); } catch { /* Reader may already be disposed. */ }
+			process.Dispose();
+			if (ReferenceEquals(_launchedProcess, process)) _launchedProcess = null;
+		};
+		process.OutputDataReceived += (_, args) =>
+		{
+			if (args.Data is not null) OnTargetOutput?.Invoke("stdout", args.Data);
+		};
+		process.ErrorDataReceived += (_, args) =>
+		{
+			if (args.Data is not null) OnTargetOutput?.Invoke("stderr", args.Data);
+		};
+		process.BeginOutputReadLine();
+		process.BeginErrorReadLine();
 
 		_processId = process.Id;
 		var processId = _processId;
@@ -647,6 +665,7 @@ public partial class ManagedDebugger
 		}
 		else
 		{
+			_keepOutputReaders = true;
 			if (_process is not null && _isAttached && _process?.TryIsRunning(out var isRunning) is HRESULT.S_OK && isRunning)
 			{
 				var hResult = _process.TryStop(0);

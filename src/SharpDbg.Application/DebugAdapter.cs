@@ -75,7 +75,7 @@ public class DebugAdapter : DebugAdapterBase
 			});
 		};
 
-		_debugger.OnStopped2 += (threadId, filePath, line, column, reason, decompiledSourceInfo) =>
+		_debugger.OnStopped2 += (threadId, filePath, line, column, reason, decompiledSourceInfo, _) =>
 		{
 			var source = new Source { Path = filePath };
 			var stoppedEvent = new StoppedEvent
@@ -176,6 +176,19 @@ public class DebugAdapter : DebugAdapterBase
 			{
 				Category = OutputEvent.CategoryValue.Stdout,
 				Output = output
+			});
+		};
+		_debugger.OnTargetOutput += (channel, output) =>
+		{
+			Protocol.SendEvent(new OutputEvent
+			{
+				Category = channel switch
+				{
+					"stderr" => OutputEvent.CategoryValue.Stderr,
+					"debug" => OutputEvent.CategoryValue.Console,
+					_ => OutputEvent.CategoryValue.Stdout
+				},
+				Output = output + Environment.NewLine
 			});
 		};
 		_debugger.SendRunInTerminalRequest += launchInfo =>
