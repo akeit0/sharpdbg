@@ -263,6 +263,8 @@ public partial class ManagedDebugger
 			return;
 		}
 		var corThread = exceptionEventArgs.Thread;
+		if (exceptionEventArgs.Unhandled != 0)
+			OnUnhandledException?.Invoke();
 		_asyncStepper?.Disable();
 		if (_stepper is not null)
 		{

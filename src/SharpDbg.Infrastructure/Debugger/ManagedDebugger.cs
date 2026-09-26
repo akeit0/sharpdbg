@@ -44,6 +44,7 @@ public partial class ManagedDebugger
 	public event Action<int, string, int, int, string, DecompiledSourceInfo?, int>? OnStopped2;
 	public event Action<int>? OnContinued;
 	public event Action<int?>? OnExited;
+	public event Action? OnUnhandledException;
 	public event Action<int, string>? OnThreadStarted;
 	public event Action<int, string>? OnThreadExited;
 	public event Action<string, string, string>? OnModuleLoaded;
