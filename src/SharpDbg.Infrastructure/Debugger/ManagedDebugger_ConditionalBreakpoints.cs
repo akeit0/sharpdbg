@@ -20,6 +20,7 @@ public partial class ManagedDebugger
 			if (result.Error is not null)
 			{
 				_logger?.Invoke($"Condition evaluation error for '{condition}': {result.Error}");
+				OnConditionEvaluationError?.Invoke(condition, result.Error.ToString());
 				return false; // Don't stop on error - condition couldn't be evaluated, so skip the breakpoint
 			}
 
@@ -28,6 +29,7 @@ public partial class ManagedDebugger
 		catch (Exception ex)
 		{
 			_logger?.Invoke($"Exception evaluating condition '{condition}': {ex.Message}");
+			OnConditionEvaluationError?.Invoke(condition, ex.Message);
 			return false; // Don't stop on exception - condition couldn't be evaluated, so skip the breakpoint
 		}
 	}
