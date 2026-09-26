@@ -31,7 +31,10 @@ public partial class ManagedDebugger
 	private int? _pendingAttachProcessId;
 	private int _processId;
 	private Process? _launchedProcess;
+	private int? _launchedProcessExitCode;
+	private int _exitReported;
 	private bool _keepOutputReaders;
+	public bool BreakOnThrownExceptions { get; set; } = true;
 	private bool _justMyCode;
 	private AsyncStepper? _asyncStepper;
 	private CompiledExpressionInterpreter _expressionInterpreter = null!;
@@ -40,8 +43,7 @@ public partial class ManagedDebugger
 	// ThreadId, FilePath, Line, Column, Reason, BreakpointId
 	public event Action<int, string, int, int, string, DecompiledSourceInfo?, int>? OnStopped2;
 	public event Action<int>? OnContinued;
-	public event Action? OnExited;
-	public event Action? OnTerminated;
+	public event Action<int?>? OnExited;
 	public event Action<int, string>? OnThreadStarted;
 	public event Action<int, string>? OnThreadExited;
 	public event Action<string, string, string>? OnModuleLoaded;
@@ -119,6 +121,12 @@ public partial class ManagedDebugger
 		_logger?.Invoke($"Log: {logMessageEvent.Message}");
 		OnTargetOutput?.Invoke("debug", logMessageEvent.Message.TrimEnd('\r', '\n'));
 		Continue();
+	}
+
+	private void ReportProcessExit(int? exitCode)
+	{
+		if (Interlocked.Exchange(ref _exitReported, 1) == 0)
+			OnExited?.Invoke(exitCode);
 	}
 
 	/// <summary>

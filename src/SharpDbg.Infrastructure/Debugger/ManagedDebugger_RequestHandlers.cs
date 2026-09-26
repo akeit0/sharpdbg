@@ -82,7 +82,10 @@ public partial class ManagedDebugger
 		process.EnableRaisingEvents = true;
 		process.Exited += (_, _) =>
 		{
-			try { process.WaitForExit(); } catch { /* Reader may already be disposed. */ }
+			int? exitCode = null;
+			try { process.WaitForExit(); exitCode = process.ExitCode; } catch { /* Reader may already be disposed. */ }
+			_launchedProcessExitCode = exitCode;
+			ReportProcessExit(exitCode);
 			process.Dispose();
 			if (ReferenceEquals(_launchedProcess, process)) _launchedProcess = null;
 		};

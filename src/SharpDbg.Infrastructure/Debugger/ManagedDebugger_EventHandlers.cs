@@ -22,8 +22,8 @@ public partial class ManagedDebugger
 	private void HandleProcessExited(object? sender, ExitProcessCorDebugManagedCallbackEventArgs exitProcessCorDebugManagedCallbackEventArgs)
 	{
 		_logger?.Invoke($"Process exited");
-		OnExited?.Invoke();
-		OnTerminated?.Invoke();
+		if (_launchedProcess is null)
+			ReportProcessExit(_launchedProcessExitCode);
 	}
 
 	private void HandleThreadCreated(object? sender, CreateThreadCorDebugManagedCallbackEventArgs createThreadCorDebugManagedCallbackEventArgs)
@@ -270,13 +270,7 @@ public partial class ManagedDebugger
 			_stepper = null;
 		}
 
-		// TODO: Get from BreakpointFilters, determine if user caught the exception, and conditionally continue
-		var breakOnAllExceptions = true; // Does not break if JMC is enabled and the exception is thrown and caught in library code
-		var breakOnUserUnhandledExceptions = true; // configures the debugger to stop when an exception is caught in non-user code after having been thrown in user code or traveled through user code
-		var exceptionIsCaughtByUser = false;
-
-		var shouldContinue = false;
-		if (shouldContinue)
+		if (!BreakOnThrownExceptions)
 		{
 			ContinueWithVariableClear();
 			return;
