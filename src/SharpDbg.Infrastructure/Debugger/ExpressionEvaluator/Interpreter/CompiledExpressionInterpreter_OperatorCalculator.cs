@@ -110,6 +110,40 @@ public partial class CompiledExpressionInterpreter
 	{
 		var (data1, type1) = await GetOperandDataTypeByValue(value1);
 		var (data2, type2) = await GetOperandDataTypeByValue(value2);
+		var floating = type1 is CorElementType.R4 or CorElementType.R8
+			|| type2 is CorElementType.R4 or CorElementType.R8;
+
+		if (opType is OperationType.EqualsExpression or OperationType.NotEqualsExpression
+			or OperationType.LessThanExpression or OperationType.GreaterThanExpression
+			or OperationType.LessThanOrEqualExpression or OperationType.GreaterThanOrEqualExpression)
+		{
+			var comparison = floating
+				? CompareFloating(ToDouble(type1, data1), ToDouble(type2, data2), opType)
+				: CompareNumbers(ToDecimal(type1, data1), ToDecimal(type2, data2), opType);
+			var boolean = await CreateBooleanValue(comparison);
+			evalStack.First!.Value.CorDebugValue = boolean;
+			return boolean;
+		}
+
+		if (floating)
+		{
+			var left = ToDouble(type1, data1);
+			var right = ToDouble(type2, data2);
+			var number = opType switch
+			{
+				OperationType.AddExpression => left + right,
+				OperationType.SubtractExpression => left - right,
+				OperationType.MultiplyExpression => left * right,
+				OperationType.DivideExpression => left / right,
+				OperationType.ModuloExpression => left % right,
+				_ => throw new ArgumentException($"Unsupported floating-point operation: {opType}")
+			};
+			var floatingResult = type1 == CorElementType.R8 || type2 == CorElementType.R8
+				? await CreatePrimitiveValue(CorElementType.R8, BitConverter.GetBytes(number))
+				: await CreatePrimitiveValue(CorElementType.R4, BitConverter.GetBytes((float)number));
+			evalStack.First!.Value.CorDebugValue = floatingResult;
+			return floatingResult;
+		}
 
 		var resultData = CalculatePrimitive(type1, type2, opType, data1, data2);
 		var result = await CreateValueFromPrimitiveData(resultData);
@@ -117,6 +151,54 @@ public partial class CompiledExpressionInterpreter
 		evalStack.First!.Value.CorDebugValue = result;
 		return result;
 	}
+
+	private static bool CompareNumbers<T>(T left, T right, OperationType operation)
+		where T : IComparable<T>
+	{
+		var comparison = left.CompareTo(right);
+		return operation switch
+		{
+			OperationType.EqualsExpression => comparison == 0,
+			OperationType.NotEqualsExpression => comparison != 0,
+			OperationType.LessThanExpression => comparison < 0,
+			OperationType.GreaterThanExpression => comparison > 0,
+			OperationType.LessThanOrEqualExpression => comparison <= 0,
+			OperationType.GreaterThanOrEqualExpression => comparison >= 0,
+			_ => throw new ArgumentException($"Unsupported comparison: {operation}")
+		};
+	}
+
+	private static bool CompareFloating(double left, double right, OperationType operation) =>
+		operation switch
+		{
+			OperationType.EqualsExpression => left == right,
+			OperationType.NotEqualsExpression => left != right,
+			OperationType.LessThanExpression => left < right,
+			OperationType.GreaterThanExpression => left > right,
+			OperationType.LessThanOrEqualExpression => left <= right,
+			OperationType.GreaterThanOrEqualExpression => left >= right,
+			_ => throw new ArgumentException($"Unsupported comparison: {operation}")
+		};
+
+	private static double ToDouble(CorElementType type, byte[] data) => type switch
+	{
+		CorElementType.R8 => BitConverter.ToDouble(data),
+		CorElementType.R4 => BitConverter.ToSingle(data),
+		_ => (double)ToDecimal(type, data)
+	};
+
+	private static decimal ToDecimal(CorElementType type, byte[] data) => type switch
+	{
+		CorElementType.Boolean or CorElementType.U1 => data[0],
+		CorElementType.I1 => (sbyte)data[0],
+		CorElementType.Char or CorElementType.U2 => BitConverter.ToUInt16(data),
+		CorElementType.I2 => BitConverter.ToInt16(data),
+		CorElementType.U4 => BitConverter.ToUInt32(data),
+		CorElementType.I4 => BitConverter.ToInt32(data),
+		CorElementType.U8 => BitConverter.ToUInt64(data),
+		CorElementType.I8 => BitConverter.ToInt64(data),
+		_ => throw new ArgumentException($"Unsupported numeric type: {type}")
+	};
 
 	private async Task<CorDebugValue> CalculatePrimitiveOperand(
 		OperationType opType,
