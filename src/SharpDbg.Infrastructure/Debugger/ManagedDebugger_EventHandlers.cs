@@ -263,7 +263,8 @@ public partial class ManagedDebugger
 			return;
 		}
 		var corThread = exceptionEventArgs.Thread;
-		if (exceptionEventArgs.Unhandled != 0)
+		var isUnhandled = exceptionEventArgs.Unhandled != 0;
+		if (isUnhandled)
 			OnUnhandledException?.Invoke();
 		_asyncStepper?.Disable();
 		if (_stepper is not null)
@@ -272,7 +273,8 @@ public partial class ManagedDebugger
 			_stepper = null;
 		}
 
-		if (!BreakOnThrownExceptions)
+		if (ExceptionStopMode == ManagedExceptionStopMode.None
+			|| (ExceptionStopMode == ManagedExceptionStopMode.Unhandled && !isUnhandled))
 		{
 			ContinueWithVariableClear();
 			return;

@@ -706,7 +706,12 @@ public partial class ManagedDebugger
 		{
 			ExceptionId = $"CLR/{friendlyTypeName}",
 			Description = $"Exception thrown: '{friendlyTypeName}' in {source}.dll: '{message}'",
-			BreakMode = SharpDbgExceptionBreakMode.Always,
+			BreakMode = ExceptionStopMode switch
+			{
+				ManagedExceptionStopMode.Unhandled => SharpDbgExceptionBreakMode.Unhandled,
+				ManagedExceptionStopMode.None => SharpDbgExceptionBreakMode.Never,
+				_ => SharpDbgExceptionBreakMode.Always,
+			},
 			Code = 0,
 			Details = new ExceptionInfo.ExceptionDetails
 			{

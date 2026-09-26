@@ -14,6 +14,8 @@ using ZLinq;
 
 namespace SharpDbg.Infrastructure.Debugger;
 
+public enum ManagedExceptionStopMode { All, Unhandled, None }
+
 // v1 of this class was AI generated, and could definitely do with some cleaning up
 public partial class ManagedDebugger
 {
@@ -34,7 +36,7 @@ public partial class ManagedDebugger
 	private int? _launchedProcessExitCode;
 	private int _exitReported;
 	private bool _keepOutputReaders;
-	public bool BreakOnThrownExceptions { get; set; } = true;
+	public ManagedExceptionStopMode ExceptionStopMode { get; set; } = ManagedExceptionStopMode.All;
 	private bool _justMyCode;
 	private AsyncStepper? _asyncStepper;
 	private CompiledExpressionInterpreter _expressionInterpreter = null!;
