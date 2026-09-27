@@ -26,6 +26,7 @@ public partial class ManagedDebugger
 			// We do NOT return here: non-captured locals declared inside the lambda body are still plain IL locals
 			// on the lambda method frame and must also be read below.
 			await AddClosureChainMembers(classContainingHoistedLocalsValue, threadId, stackDepth, result);
+			MarkHoistedArguments(module, corDebugFunction, result);
 		}
 		var corDebugIlFrame = GetIlFrameForThreadIdAndStackDepth(threadId, stackDepth);
 		if (corDebugIlFrame.LocalVariables.Length is 0) return;
@@ -52,6 +53,23 @@ public partial class ManagedDebugger
 					VariablesReference = GetVariablesReference(localVariableCorDebugValue, friendlyTypeName, threadId, stackDepth, debuggerProxyInstance)
 				});
 			});
+		}
+	}
+
+	private static void MarkHoistedArguments(ModuleInfo module, ICorDebugFunction corDebugFunction, List<VariableInfo> result)
+	{
+		var kickoffToken = module.MetadataReader.GetStateMachineKickoffMethodToken(corDebugFunction.Token);
+		if (kickoffToken is null) return;
+		var reader = module.MetadataReader.PeMetadataReader;
+		var method = reader.GetMethodDefinition((MethodDefinitionHandle)MetadataTokens.Handle(kickoffToken.Value));
+		var parameterNames = method.GetParameters()
+			.Select(reader.GetParameter)
+			.Where(parameter => parameter.SequenceNumber > 0)
+			.Select(parameter => reader.GetString(parameter.Name))
+			.ToHashSet(StringComparer.Ordinal);
+		foreach (var variable in result)
+		{
+			if (parameterNames.Contains(variable.Name)) variable.IsArgument = true;
 		}
 	}
 
