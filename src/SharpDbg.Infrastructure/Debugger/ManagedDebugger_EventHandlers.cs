@@ -414,7 +414,8 @@ public partial class ManagedDebugger
 				_exceptionStates[threadId] = state;
 				shouldStop = ExceptionStopMode is null
 					? MatchesExceptionBreakpoint(SharpDbgExceptionBreakpointFilter.All, exceptionType)
-					: ExceptionStopMode == ManagedExceptionStopMode.All;
+					: ExceptionStopMode == ManagedExceptionStopMode.All
+						|| ExceptionStopMode == ManagedExceptionStopMode.User && IsUserModuleFrame(corThread.ActiveFrame);
 				state.AlwaysStopReported = shouldStop;
 				breakMode = SharpDbgExceptionBreakMode.Always;
 				break;
@@ -433,7 +434,8 @@ public partial class ManagedDebugger
 				state.HasReachedUserCode = true;
 				shouldStop = state.AlwaysStopReported is false && (ExceptionStopMode is null
 					? MatchesExceptionBreakpoint(SharpDbgExceptionBreakpointFilter.All, exceptionType)
-					: ExceptionStopMode == ManagedExceptionStopMode.All);
+					: ExceptionStopMode == ManagedExceptionStopMode.All
+						|| ExceptionStopMode == ManagedExceptionStopMode.User && IsUserModuleFrame(corThread.ActiveFrame));
 				state.AlwaysStopReported |= shouldStop;
 				breakMode = SharpDbgExceptionBreakMode.Always;
 				break;
@@ -479,6 +481,11 @@ public partial class ManagedDebugger
 	private bool IsUserCodeFrame(ICorDebugFrame? frame)
 	{
 		if (_justMyCode is false) return false;
+		return IsUserModuleFrame(frame);
+	}
+
+	private bool IsUserModuleFrame(ICorDebugFrame? frame)
+	{
 		try
 		{
 			return frame is not null && _modules.TryGetValue(frame.Function.Module.BaseAddress, out var module) && module.IsUserCode;

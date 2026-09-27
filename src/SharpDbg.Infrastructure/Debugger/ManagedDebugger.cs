@@ -9,7 +9,7 @@ using SharpDbg.Infrastructure.Debugger.Models.Response;
 
 namespace SharpDbg.Infrastructure.Debugger;
 
-public enum ManagedExceptionStopMode { All, Unhandled, None }
+public enum ManagedExceptionStopMode { All, User, Unhandled, None }
 
 // v1 of this class was AI generated, and could definitely do with some cleaning up
 public partial class ManagedDebugger
