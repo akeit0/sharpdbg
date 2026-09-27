@@ -519,6 +519,8 @@ public partial class ManagedDebugger
 		return CreateStackFrameInfo(frameId, frame, true);
 	}
 
+	public bool IsSyntheticAsyncCallerFrame(int frameId) => _frameReferenceManager.GetSyntheticAsyncFrameById(frameId) is not null;
+
 	private StackFrameInfo CreateStackFrameInfo(int frameId, ICorDebugFrame frame, bool decompileIfNeeded)
 	{
 		var stackFrameInfo = new StackFrameInfo
