@@ -91,7 +91,7 @@ internal sealed class CilExpressionCompiler(ManagedDebugger debugger)
 	private static readonly PortableExecutableReference _intrinsicMethodsReference = MetadataReference.CreateFromImage(CreateIntrinsicMethodsAssembly());
 
 	private const int CacheCapacity = 256;
-	private readonly record struct CompileCacheKey(int ModuleVersion, CompileContextKind ContextKind, CORDB_ADDRESS Module, int Token, int IlOffset, string Expression, bool HasException);
+	private readonly record struct CompileCacheKey(int ModuleVersion, CompileContextKind ContextKind, CORDB_ADDRESS Module, int Token, int IlOffset, string Expression, string? ExceptionType);
 	private enum CompileContextKind { Method, Type }
 	private readonly Dictionary<CompileCacheKey, CacheEntry> _compileCache = new();
 	private readonly LinkedList<CompileCacheKey> _compileLru = new();
@@ -112,9 +112,10 @@ internal sealed class CilExpressionCompiler(ManagedDebugger debugger)
 		}
 		var frame = debugger.GetIlFrameForThreadIdAndStackDepth(context.ThreadId, context.StackDepth);
 		var preferredModule = context.RootValue is not null ? context.RootValue.ExactType.Class.Module : frame.Function.Module;
-		var hasException = debugger.GetCurrentException(context.ThreadId) is not null;
+		var currentException = debugger.GetCurrentException(context.ThreadId);
+		var exceptionType = currentException is null ? null : GetExceptionAliasType(currentException);
 		EnsureModuleVersion();
-		var key = CreateCacheKey(expression, context, frame, preferredModule, hasException);
+		var key = CreateCacheKey(expression, context, frame, preferredModule, exceptionType);
 		if (TryGetCachedCompiled(key, out var cached)) return cached;
 
 		var blocks = GetMetadataBlocks(preferredModule);
@@ -125,7 +126,7 @@ internal sealed class CilExpressionCompiler(ManagedDebugger debugger)
 		var diagnostics = DiagnosticBag.GetInstance();
 		try
 		{
-			var aliases = GetAliases(hasException);
+			var aliases = GetAliases(exceptionType);
 			var result = evaluationContext.CompileExpression(
 				expression,
 				DkmEvaluationFlags.TreatAsExpression,
@@ -150,7 +151,7 @@ internal sealed class CilExpressionCompiler(ManagedDebugger debugger)
 		}
 	}
 
-	private CompileCacheKey CreateCacheKey(string expression, CompiledExpressionEvaluationContext context, ICorDebugILFrame frame, ICorDebugModule preferredModule, bool hasException)
+	private CompileCacheKey CreateCacheKey(string expression, CompiledExpressionEvaluationContext context, ICorDebugILFrame frame, ICorDebugModule preferredModule, string? exceptionType)
 	{
 		if (context.RootValue is not null)
 		{
@@ -161,7 +162,7 @@ internal sealed class CilExpressionCompiler(ManagedDebugger debugger)
 				context.RootValue.ExactType.Class.Token,
 				0,
 				expression,
-				hasException);
+				exceptionType);
 		}
 		return new CompileCacheKey(
 			debugger.ModuleSet_Version,
@@ -170,7 +171,7 @@ internal sealed class CilExpressionCompiler(ManagedDebugger debugger)
 			frame.Function.Token,
 			EvaluationContextBase.NormalizeILOffset((uint)frame.IP.pnOffset),
 			expression,
-			hasException);
+			exceptionType);
 	}
 
 	private bool TryGetCachedCompiled(CompileCacheKey key, out CompiledEvaluationMethod result)
@@ -208,9 +209,39 @@ internal sealed class CilExpressionCompiler(ManagedDebugger debugger)
 		_metadataBlocksCache.Clear();
 	}
 
-	private static ImmutableArray<Alias> GetAliases(bool hasException) => hasException
-		? [new Alias(DkmClrAliasKind.Exception, "Error", "$exception", typeof(Exception).AssemblyQualifiedName!, Guid.Empty, null!)]
+	private static ImmutableArray<Alias> GetAliases(string? exceptionType) => exceptionType is not null
+		? [new Alias(DkmClrAliasKind.Exception, "Error", "$exception", exceptionType, Guid.Empty, null!)]
 		: ImmutableArray<Alias>.Empty;
+
+	private string GetExceptionAliasType(ICorDebugValue exception)
+	{
+		var type = exception.ExactType;
+		if (type.TypeParameters.Any()) return typeof(Exception).AssemblyQualifiedName!;
+		var moduleInfo = debugger.GetModuleInfoForModule(type.Class.Module);
+		var metadata = moduleInfo.MetadataReader.PeMetadataReader;
+		if (!metadata.IsAssembly) return typeof(Exception).AssemblyQualifiedName!;
+		var typeName = GetMetadataTypeName(metadata, (TypeDefinitionHandle)MetadataTokens.Handle(type.Class.Token));
+		if (typeName.Contains('`')) return typeof(Exception).AssemblyQualifiedName!;
+		var assembly = metadata.GetAssemblyDefinition();
+		var identity = new System.Reflection.AssemblyName(metadata.GetString(assembly.Name))
+		{
+			Version = assembly.Version,
+			CultureName = metadata.GetString(assembly.Culture)
+		};
+		if (!assembly.PublicKey.IsNil) identity.SetPublicKey(metadata.GetBlobBytes(assembly.PublicKey));
+		var assemblyName = identity.FullName;
+		return $"{typeName}, {assemblyName}";
+	}
+
+	private static string GetMetadataTypeName(MetadataReader metadata, TypeDefinitionHandle handle)
+	{
+		var definition = metadata.GetTypeDefinition(handle);
+		var name = metadata.GetString(definition.Name);
+		var parent = definition.GetDeclaringType();
+		if (!parent.IsNil) return $"{GetMetadataTypeName(metadata, parent)}+{name}";
+		var typeNamespace = metadata.GetString(definition.Namespace);
+		return string.IsNullOrEmpty(typeNamespace) ? name : $"{typeNamespace}.{name}";
+	}
 
 	internal DelegateMaterializerAssembly GetDelegateMaterializer(CompiledExpressionEvaluationContext context)
 	{
