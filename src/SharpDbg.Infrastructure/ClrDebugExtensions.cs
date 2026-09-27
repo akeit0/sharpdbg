@@ -11,13 +11,29 @@ namespace SharpDbg.Infrastructure;
 // Originally based on https://github.com/lordmilko/ClrDebug/blob/5f46218f4b840ab8a94920623dc263b5f2334138/Samples/NetCore/Program.cs
 public static class ClrDebugExtensions
 {
+	private sealed record StartupRegistration(
+		TaskCompletionSource<(ICorDebug? CorDebug, int Hr)> Completion,
+		Action<ICorDebug>? BeforeRuntimeContinues);
+
 	[UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
 	public static unsafe void OnRuntimeStartup(void* pCorDebug, void* parameter, int hr)
 	{
-		var corDebug = ComInterfaceMarshaller<ICorDebug>.ConvertToManaged(pCorDebug);
-		var runtimeStartupTcs = GCHandle.FromIntPtr((IntPtr)parameter).Target as TaskCompletionSource<(ICorDebug? CorDebug, int Hr)>;
-		Guard.Against.Null(runtimeStartupTcs);
-		runtimeStartupTcs.SetResult((corDebug, hr));
+		var registration = GCHandle.FromIntPtr((IntPtr)parameter).Target as StartupRegistration;
+		if (registration is null) return;
+		try
+		{
+			var corDebug = ComInterfaceMarshaller<ICorDebug>.ConvertToManaged(pCorDebug);
+			if (hr >= 0 && corDebug is not null)
+			{
+				// The runtime resumes when this callback returns. Attach before releasing it.
+				registration.BeforeRuntimeContinues?.Invoke(corDebug);
+			}
+			registration.Completion.TrySetResult((corDebug, hr));
+		}
+		catch (Exception ex)
+		{
+			registration.Completion.TrySetException(ex);
+		}
 	}
 
 	public static ICorDebug Mobile(RemoteAttachInfo remoteAttachInfo)
@@ -35,8 +51,13 @@ public static class ClrDebugExtensions
 		return corDebug;
 	}
 
-	/// pass resumeDiagnosticSuspension true if the process was launched with the DOTNET_DefaultDiagnosticPortSuspend environment variable, and you wish for it to be resumed after RegisterForRuntimeStartup
-	public static async Task<ICorDebug> Automatic(int pid, bool resumeDiagnosticSuspension = false)
+	/// <summary>Waits for CLR startup and optionally attaches while the startup callback holds the runtime.</summary>
+	/// <param name="resumeDiagnosticSuspension">Resume a process launched with DOTNET_DefaultDiagnosticPortSuspend after registration.</param>
+	/// <param name="beforeRuntimeContinues">Runs inside the startup callback, before the target runtime resumes.</param>
+	public static async Task<ICorDebug> Automatic(
+		int pid,
+		bool resumeDiagnosticSuspension = false,
+		Action<ICorDebug>? beforeRuntimeContinues = null)
 	{
 		IntPtr unregisterToken = IntPtr.Zero;
 		GCHandle runtimeStartupTcsHandle = default;
@@ -54,7 +75,7 @@ public static class ClrDebugExtensions
 			 * you use RegisterForRuntimeStartup */
 
 			var runtimeStartupTcs = new TaskCompletionSource<(ICorDebug? CorDebug, int Hr)>(TaskCreationOptions.RunContinuationsAsynchronously);
-			runtimeStartupTcsHandle = GCHandle.Alloc(runtimeStartupTcs);
+			runtimeStartupTcsHandle = GCHandle.Alloc(new StartupRegistration(runtimeStartupTcs, beforeRuntimeContinues));
 			unsafe
 			{
 				var registerHr = DbgShim.RegisterForRuntimeStartup(checked((uint)pid), &OnRuntimeStartup, GCHandle.ToIntPtr(runtimeStartupTcsHandle), out unregisterToken);

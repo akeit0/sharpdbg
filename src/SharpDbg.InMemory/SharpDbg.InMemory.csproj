@@ -28,7 +28,7 @@
 			<IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
 		</PackageReference>
 
-		<PackageReference Include="Microsoft.Diagnostics.DbgShim" Version="9.0.661903" />
+		<PackageReference Include="Microsoft.Diagnostics.DbgShim" Version="10.0.745401" />
 
 		<!-- We must include all package references required by projects that we reference -->
 		<PackageReference Include="Ardalis.GuardClauses" Version="5.0.0" />
