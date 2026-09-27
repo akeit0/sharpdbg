@@ -11,5 +11,6 @@ public class StackFrameInfo
 	public required string? Source { get; set; }
 	public required bool IsUserCode { get; set; }
 	public required bool IsResolved { get; set; }
+	public bool IsSyntheticAsyncCaller { get; set; }
 	public required DecompiledSourceInfo? DecompiledSourceInfo { get; set; }
 }

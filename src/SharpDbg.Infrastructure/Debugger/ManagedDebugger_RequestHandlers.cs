@@ -582,6 +582,7 @@ public partial class ManagedDebugger
 			Source = source?.FilePath,
 			IsUserCode = frame.Module.IsUserCode,
 			IsResolved = frame.Module.MetadataReader.HasSymbols,
+			IsSyntheticAsyncCaller = true,
 			DecompiledSourceInfo = source?.DecompiledSourceInfo
 		};
 	}
