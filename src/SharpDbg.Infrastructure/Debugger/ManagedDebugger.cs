@@ -490,7 +490,7 @@ public partial class ManagedDebugger
 	}
 
 	// Not intended to implement IDisposable - it is intended that this is called via Disconnect()
-	private void Dispose()
+	private void Dispose(bool requireDetachSuccess = false)
 	{
 		if (_process is null) return; // A client may call Terminate, then Disconnect, both of which call Dispose. Dispose only needs to be run once.
 
@@ -540,7 +540,12 @@ public partial class ManagedDebugger
 		while (_runtimeEventChannel.Reader.TryRead(out _)) { }
 
 		// Detach from the process
-		_process?.TryDetach();
+		var processExited = _debuggeeProcess?.HasExited is true;
+		var detachResult = processExited ? Cor.CORDBG_E_PROCESS_TERMINATED : _process.TryDetach();
+		if (requireDetachSuccess && detachResult is not (Cor.S_OK or Cor.CORDBG_E_PROCESS_TERMINATED))
+		{
+			throw new InvalidOperationException($"Failed to detach debugger from process: {detachResult}");
+		}
 
 		_isAttached = false;
 		_process = null;

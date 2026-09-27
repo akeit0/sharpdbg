@@ -807,10 +807,10 @@ public partial class ManagedDebugger
 		{
 			if (_process is not null && _isAttached && _process?.TryIsRunning(out var isRunning) is Cor.S_OK && isRunning)
 			{
-				var hResult = _process.TryStop(0);
-				if (hResult is not (Cor.S_OK or Cor.CORDBG_E_PROCESS_TERMINATED)) _logger?.Invoke($"Error stopping process during disconnect: {hResult}");
+				var hResult = _process.TryStop(1000);
+				if (hResult is not (Cor.S_OK or Cor.CORDBG_E_PROCESS_TERMINATED)) throw new InvalidOperationException($"Failed to stop process before detach: {hResult}");
 			}
-			Dispose();
+			Dispose(requireDetachSuccess: true);
 		}
 	}
 
